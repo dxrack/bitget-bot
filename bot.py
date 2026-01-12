@@ -9,35 +9,46 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-# 환경변수 확인
 api_key = os.environ.get('BITGET_API_KEY')
 secret_key = os.environ.get('BITGET_SECRET_KEY')
 passphrase = os.environ.get('BITGET_PASSPHRASE')
 
-logging.info("="*80)
-logging.info("🤖 Live Bot v23 Trailing 시작 (Railway 테스트 버전)")
-logging.info("="*80)
+logging.info("=" * 80)
+logging.info("Bot Started")
+logging.info("=" * 80)
 
 if api_key and secret_key and passphrase:
-    logging.info("✅ API Key 인증 성공!")
-    logging.info("✅ Secret Key 인증 성공!")
-    logging.info("✅ Passphrase 인증 성공!")
+    logging.info("API Key OK")
+    logging.info("Secret Key OK")
+    logging.info("Passphrase OK")
 else:
-    logging.error("❌ 환경변수 설정 필요!")
+    logging.error("Environment variables missing!")
     sys.exit(1)
 
-logging.info("="*80)
-logging.info("✅ 봇이 정상적으로 실행 중입니다!")
-logging.info("="*80)
+logging.info("Bot is running!")
 
-# 무한 대기
 while True:
     time.sleep(60)
-    logging.info("대기 중... (정상 작동)")
+    logging.info("Running...")
 ```
+
+**정확하게 이 코드를 복사해서 붙여넣으세요!**
 
 ---
 
 ### **Step 4️⃣: Commit**
 ```
-Message: "Simplify bot.py to test version"
+Message: "Fix bot.py syntax error"
+```
+
+---
+
+### **Step 5️⃣: 자동 배포 대기**
+```
+1-2분 후:
+
+✅ Logs에 "Bot Started" 메시지
+✅ "API Key OK" 메시지들
+✅ "Running..." 반복
+
+완벽해집니다! ✅
