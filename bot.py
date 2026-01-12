@@ -36,6 +36,11 @@ should_exit = False
 cached_base_data = None
 last_cache_time = None
 
+# 동기화 모드
+bot_mode = "LIVE"
+virtual_position = None
+sync_monitor = None
+
 # ==============================================================================
 # [로그 설정]
 # ==============================================================================
@@ -47,8 +52,48 @@ logging.basicConfig(
 
 logging.info("="*80)
 logging.info("실전봇 v23 Trailing 버전 시작 (Risk-Free + Trailing Gap)")
-logging.info("로그는 Railway 대시보드에서 확인할 수 있습니다")
 logging.info("="*80)
+
+# ==============================================================================
+# [동기화 모드 함수]
+# ==============================================================================
+def load_sync_config():
+    """sync_config.json 파일 읽기"""
+    config_file = 'sync_config.json'
+    if not os.path.exists(config_file):
+        return None
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        if not config.get('enabled', False):
+            return None
+        return config
+    except Exception as e:
+        logging.error(f"동기화 설정 읽기 실패: {e}")
+        return None
+
+def log_virtual_trade_entry(side, entry_price, initial_sl):
+    logging.info("━"*60)
+    logging.info(f"[가상 포지션 진입] {side.upper()}")
+    logging.info(f"  진입가: {entry_price:.6f}")
+    logging.info(f"  초기 SL: {initial_sl:.6f}")
+    logging.info("━"*60)
+
+def log_virtual_trade_exit(side, entry_price, exit_price, initial_sl, final_sl, reason):
+    if side == 'long':
+        pnl_pct = (exit_price / entry_price - 1) * 100
+    else:
+        pnl_pct = (entry_price / exit_price - 1) * 100
+    
+    fee_pct = 0.08
+    net_pnl_pct = pnl_pct - fee_pct
+    
+    logging.info("━"*60)
+    logging.info(f"[가상 포지션 청산] {side.upper()}")
+    logging.info(f"  진입가: {entry_price:.6f} → 청산가: {exit_price:.6f}")
+    logging.info(f"  사유: {reason}")
+    logging.info(f"  수익률: {net_pnl_pct:+.2f}% (실제 거래 없음)")
+    logging.info("━"*60)
 
 # ==============================================================================
 # [Numba - Supertrend 계산]
@@ -130,7 +175,6 @@ symbol = 'LINK/USDT:USDT'
 base_timeframe = '3m'
 higher_timeframe = '3m'
 
-# 전략 파라미터
 trailing_trigger_pct = 3.00
 trailing_gap_pct = 1.90
 stop_loss_pct = 2.80
@@ -139,7 +183,6 @@ be_buffer_pct = 0.2
 atr_period = 81
 atr_multiplier = 8.1
 
-# 설정
 START_CAPITAL = 30.0
 MIN_ENTRY_USDT = 5.0
 MAX_ENTRY_USDT = 10000.0
@@ -299,7 +342,6 @@ def get_signal_with_detail(exchange, symbol, use_cache=True):
         base_df['timestamp'] = pd.to_datetime(base_df['timestamp'], unit='ms')
         base_df.set_index('timestamp', inplace=True)
         
-        # Engulfing 패턴
         base_df['prev_open'] = base_df['open'].shift(1)
         base_df['prev_close'] = base_df['close'].shift(1)
         
@@ -317,7 +359,6 @@ def get_signal_with_detail(exchange, symbol, use_cache=True):
             (base_df['close'] < base_df['prev_open'])
         ).astype(bool)
         
-        # Supertrend
         st_df = calculate_supertrend_fast(base_df, atr_period, atr_multiplier)
         base_df['trend'] = st_df['direction']
         
@@ -331,7 +372,6 @@ def get_signal_with_detail(exchange, symbol, use_cache=True):
         bull_pattern = signal_candle['isBullishEngulfing']
         bear_pattern = signal_candle['isBearishEngulfing']
         
-        # 신호 판정
         is_long = (trend == 1) and bull_pattern
         is_short = (trend == -1) and bear_pattern
         
@@ -347,7 +387,106 @@ def get_signal_with_detail(exchange, symbol, use_cache=True):
         return None, None
 
 # ==============================================================================
-# [포지션 모니터]
+# [가상 포지션 모니터] - 동기화 모드용
+# ==============================================================================
+class VirtualPositionMonitor:
+    def __init__(self, exchange, symbol, side, entry, initial_sl):
+        self.exchange = exchange
+        self.symbol = symbol
+        self.side = side
+        self.entry = entry
+        self.initial_sl = initial_sl
+        self.current_sl = initial_sl
+        self.should_stop = False
+        self._last_print = 0
+        
+        self.trailing_active = False
+        self.extreme_price = entry
+        
+    def check_exit(self):
+        try:
+            ticker = self.exchange.fetch_ticker(self.symbol)
+            current_price = float(ticker.get('last', 0))
+            
+            now = time.time()
+            if now - self._last_print > 60:
+                status = "BE" if self.trailing_active else "Wait"
+                logging.info(f"[가상] {current_price:.4f} | SL:{self.current_sl:.4f} | {status}")
+                self._last_print = now
+            
+            if current_price == 0:
+                return None, None
+            
+            if self.side == 'long':
+                if not self.trailing_active:
+                    if current_price >= self.entry * (1 + trailing_trigger_pct / 100):
+                        self.trailing_active = True
+                        be_price = self.entry * (1 + be_buffer_pct / 100)
+                        if self.current_sl < be_price:
+                            self.current_sl = be_price
+                        self.extreme_price = current_price
+                        logging.info(f"[가상] Risk-Free 발동! BE: {be_price:.6f}")
+                
+                if self.trailing_active:
+                    if current_price > self.extreme_price:
+                        self.extreme_price = current_price
+                        new_sl = self.extreme_price * (1 - trailing_gap_pct / 100)
+                        if new_sl > self.current_sl:
+                            self.current_sl = new_sl
+                
+                if current_price <= self.current_sl:
+                    reason = "Risk-Free" if self.trailing_active else "SL"
+                    return reason, current_price
+            else:
+                if not self.trailing_active:
+                    if current_price <= self.entry * (1 - trailing_trigger_pct / 100):
+                        self.trailing_active = True
+                        be_price = self.entry * (1 - be_buffer_pct / 100)
+                        if self.current_sl > be_price:
+                            self.current_sl = be_price
+                        self.extreme_price = current_price
+                        logging.info(f"[가상] Risk-Free 발동! BE: {be_price:.6f}")
+                
+                if self.trailing_active:
+                    if current_price < self.extreme_price:
+                        self.extreme_price = current_price
+                        new_sl = self.extreme_price * (1 + trailing_gap_pct / 100)
+                        if new_sl < self.current_sl:
+                            self.current_sl = new_sl
+                
+                if current_price >= self.current_sl:
+                    reason = "Risk-Free" if self.trailing_active else "SL"
+                    return reason, current_price
+            
+            return None, None
+        except:
+            return None, None
+    
+    def run(self):
+        logging.info(f"[가상 포지션] {self.side.upper()} Entry:{self.entry:.6f} SL:{self.initial_sl:.6f}")
+        log_virtual_trade_entry(self.side, self.entry, self.initial_sl)
+        
+        while not self.should_stop and not should_exit:
+            reason, exit_price = self.check_exit()
+            
+            if reason:
+                logging.info(f"[가상] 청산: {reason} @ {exit_price:.6f}")
+                log_virtual_trade_exit(
+                    side=self.side,
+                    entry_price=self.entry,
+                    exit_price=exit_price,
+                    initial_sl=self.initial_sl,
+                    final_sl=self.current_sl,
+                    reason=reason
+                )
+                
+                self.should_stop = True
+                break
+            
+            time.sleep(MONITOR_INTERVAL)
+
+# ==============================================================================
+# [실제 포지션 모니터]
 # ==============================================================================
 class PositionMonitor:
     def __init__(self, exchange, symbol, side, entry, initial_sl, qty, order_id, entry_time, entry_amount):
@@ -516,16 +655,45 @@ def execute_entry_with_trailing(exchange, symbol, side, entry_price):
         logging.error(f"Entry failed: {e}")
         return False, None
 
+def execute_virtual_entry(exchange, symbol, side, entry_price):
+    """가상 포지션 진입"""
+    p_prec, _ = get_precision(exchange, symbol)
+    
+    if side == 'long':
+        initial_sl_raw = entry_price * (1 - stop_loss_pct / 100)
+    else:
+        initial_sl_raw = entry_price * (1 + stop_loss_pct / 100)
+    
+    initial_sl = truncate(initial_sl_raw, p_prec)
+    
+    monitor = VirtualPositionMonitor(exchange, symbol, side, entry_price, initial_sl)
+    
+    monitor_thread = threading.Thread(target=monitor.run, daemon=True)
+    monitor_thread.start()
+    
+    return monitor
+
 # ==============================================================================
 # [메인 루프]
 # ==============================================================================
 def run_live_bot():
-    global bot_capital, should_exit
+    global bot_capital, should_exit, bot_mode, sync_monitor, virtual_position
     
     exchange = ccxt.bitget(API_CONFIG)
     
+    # 동기화 모드 확인
+    sync_config = load_sync_config()
+    
+    if sync_config and sync_config.get('enabled'):
+        bot_mode = "SYNC"
+    else:
+        bot_mode = "LIVE"
+    
     print("\n" + "="*70)
-    print("  Live Bot v23 Trailing (Risk-Free + Trailing Gap)")
+    if bot_mode == "SYNC":
+        print("  Live Bot v23 Trailing (동기화 모드)")
+    else:
+        print("  Live Bot v23 Trailing (실전 모드)")
     print("="*70)
     print(f"  Symbol: {symbol}")
     print(f"  Capital: {START_CAPITAL:.2f} USDT")
@@ -533,13 +701,43 @@ def run_live_bot():
     print(f"  Trailing Gap: {trailing_gap_pct}%")
     print("="*70 + "\n")
     
-    logging.info(f"Bot Start: {symbol} Capital:{START_CAPITAL}")
+    logging.info(f"Bot Start: {symbol} Mode:{bot_mode} Capital:{START_CAPITAL}")
+    
+    if bot_mode == "SYNC":
+        logging.info(f"Sync Config: {sync_config['position_type'].upper()} @ {sync_config['entry_price']:.6f}")
+        sync_monitor = execute_virtual_entry(
+            exchange, symbol, 
+            sync_config['position_type'].lower(), 
+            sync_config['entry_price']
+        )
     
     last_signal_time = None
     current_monitor = None
     
     while not should_exit:
         try:
+            # 동기화 모드에서 가상 포지션이 종료되면 실전으로 전환
+            if bot_mode == "SYNC" and sync_monitor and sync_monitor.should_stop:
+                logging.info("가상 포지션 종료 - 실전 모드로 전환")
+                bot_mode = "LIVE"
+                sync_monitor = None
+                
+                # sync_config.json 업데이트
+                try:
+                    with open('sync_config.json', 'w', encoding='utf-8') as f:
+                        json.dump({'enabled': False}, f)
+                except:
+                    pass
+                
+                time.sleep(5)
+                continue
+            
+            # SYNC 모드일 땐 신호 생성 안 함
+            if bot_mode == "SYNC":
+                time.sleep(CHECK_INTERVAL)
+                continue
+            
+            # 실전 모드
             position = get_current_position(exchange, symbol)
             in_position = position['qty'] > 0
             
@@ -585,6 +783,22 @@ def run_live_bot():
             time.sleep(60)
     
     logging.info("Bot stopped")
+
+# ==============================================================================
+# [sync_config.json 생성 헬퍼]
+# ==============================================================================
+def create_sync_config(position_type, entry_price):
+    """동기화 설정 파일 생성"""
+    config = {
+        'enabled': True,
+        'position_type': position_type,
+        'entry_price': entry_price
+    }
+    
+    with open('sync_config.json', 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=4, ensure_ascii=False)
+    
+    logging.info(f"Sync config created: {position_type} @ {entry_price:.6f}")
 
 # ==============================================================================
 # [실행]
