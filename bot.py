@@ -238,7 +238,7 @@ def fetch_ohlcv_with_cache(exchange, symbol, timeframe, total_limit=3000, force_
     now = datetime.now()
     
     if (cached_base_data is None or force_refresh or 
-        last_cache_time is None or (now - last_cache_time).total_seconds() > 180):
+        last_cache_time is None or (now - last_cache_time).total_seconds() > 60):
         
         cached_base_data = fetch_extended_ohlcv(exchange, symbol, timeframe, total_limit)
         last_cache_time = now
@@ -750,7 +750,7 @@ def run_live_bot():
             if not in_position and not current_monitor:
                 current_time = datetime.now()
                 
-                signal, entry_price = get_signal_with_detail(exchange, symbol, use_cache=True)
+                signal, entry_price = get_signal_with_detail(exchange, symbol, use_cache=False)
                 
                 if signal:
                     if last_signal_time is None or (current_time - last_signal_time).total_seconds() > 180:
