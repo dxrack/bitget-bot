@@ -964,8 +964,9 @@ class TradingBot:
                         new_status = config.get('status', 'WAITING')
                         sync_entry = config.get('sync_entry_price', 0)
                         
-                        if old_status == 'WAITING' and new_status in ['SYNC_LONG', 'SYNC_SHORT']:
-                            if sync_entry > 0:
+                        if new_status in ['SYNC_LONG', 'SYNC_SHORT']:
+                            vm = self.virtual_managers.get(symbol)
+                            if vm and not vm.is_active and sync_entry > 0:
                                 side = 'long' if new_status == 'SYNC_LONG' else 'short'
                                 self.virtual_managers[symbol].start_sync(side, sync_entry)
                         
