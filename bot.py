@@ -5,6 +5,8 @@ Bitget Bot v24 - 웹소켓 + Google Sheets 연동 버전
 - 최대 20개 코인 동시 운영
 - Supertrend + Engulfing 패턴 전략
 - Risk-Free Trailing Stop
+
+v24.1 - 수량 계산 에러 수정
 """
 
 import ccxt
@@ -307,6 +309,41 @@ def generate_signal(symbol, config):
     return None, None
 
 # ==============================================================================
+# [정밀도 헬퍼 함수]
+# ==============================================================================
+def get_precision(exchange, symbol):
+    """거래소에서 정밀도 가져오기 (안전하게)"""
+    try:
+        market = exchange.market(symbol)
+        
+        # 가격 정밀도
+        price_prec = market.get('precision', {}).get('price')
+        if price_prec is None or price_prec <= 0 or price_prec > 8:
+            price_prec = 4
+        
+        # 수량 정밀도
+        amount_prec = market.get('precision', {}).get('amount')
+        if amount_prec is None or amount_prec <= 0 or amount_prec > 8:
+            amount_prec = 2
+        
+        return int(price_prec), int(amount_prec)
+    except Exception as e:
+        logging.warning(f"정밀도 조회 실패: {e}, 기본값 사용")
+        return 4, 2
+
+def truncate(value, precision):
+    """소수점 자르기 (안전하게)"""
+    if value is None or precision is None:
+        return 0
+    
+    try:
+        precision = max(0, min(int(precision), 8))  # 0~8 사이로 제한
+        factor = 10 ** precision
+        return int(float(value) * factor) / factor
+    except:
+        return 0
+
+# ==============================================================================
 # [포지션 관리 클래스]
 # ==============================================================================
 class PositionManager:
@@ -330,24 +367,42 @@ class PositionManager:
             capital = self.config.get('capital', 30.0)
             leverage = self.config.get('leverage', 1)
             
-            # 수량 계산
-            qty = (capital * leverage) / entry_price
+            # 정밀도 가져오기 (안전하게)
+            price_prec, amount_prec = get_precision(self.exchange, self.symbol)
             
-            # 정밀도 조정
-            market = self.exchange.market(self.symbol)
-            amount_precision = market['precision']['amount']
-            if amount_precision and amount_precision > 0:
-                qty = int(qty * (10 ** amount_precision)) / (10 ** amount_precision)
+            # 수량 계산
+            if entry_price is None or entry_price <= 0:
+                logging.error(f"[{self.symbol}] 잘못된 진입가: {entry_price}")
+                return False
+            
+            qty_raw = (capital * leverage) / float(entry_price)
+            qty = truncate(qty_raw, amount_prec)
+            
+            if qty <= 0:
+                logging.error(f"[{self.symbol}] 계산된 수량이 0 이하: {qty_raw} -> {qty}")
+                return False
+            
+            logging.info(f"[{self.symbol}] 주문 준비: {side.upper()} qty={qty} @ {entry_price}")
             
             # 레버리지 설정
-            self.exchange.set_leverage(leverage, self.symbol)
+            try:
+                self.exchange.set_leverage(leverage, self.symbol)
+            except Exception as e:
+                logging.warning(f"[{self.symbol}] 레버리지 설정 실패 (무시): {e}")
             
             # 주문 실행
             order_side = 'buy' if side == 'long' else 'sell'
             order = self.exchange.create_market_order(self.symbol, order_side, qty)
             
             # 실제 체결가
-            actual_entry = float(order.get('average', entry_price))
+            actual_entry = order.get('average')
+            if actual_entry is None:
+                # 체결가를 못 가져오면 현재 가격 사용
+                time.sleep(0.5)
+                ticker = self.exchange.fetch_ticker(self.symbol)
+                actual_entry = ticker.get('last', entry_price)
+            
+            actual_entry = float(actual_entry)
             
             # 포지션 정보 저장
             self.side = side
@@ -366,17 +421,22 @@ class PositionManager:
             
             self.is_active = True
             
-            logging.info(f"[{self.symbol}] 포지션 오픈: {side.upper()} @ {actual_entry:.6f} SL:{self.current_sl:.6f}")
+            logging.info(f"[{self.symbol}] ✅ 포지션 오픈 성공: {side.upper()} @ {actual_entry:.6f} SL:{self.current_sl:.6f}")
             
             return True
             
         except Exception as e:
-            logging.error(f"[{self.symbol}] 포지션 오픈 실패: {e}")
+            logging.error(f"[{self.symbol}] ❌ 포지션 오픈 실패: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
             return False
     
     def check_and_update(self, current_price):
         """가격 업데이트 및 청산 체크"""
         if not self.is_active:
+            return False
+        
+        if current_price is None or current_price <= 0:
             return False
         
         trigger_pct = self.config['trailing_trigger_pct'] / 100
@@ -457,7 +517,7 @@ class PositionManager:
             else:
                 pnl_pct = (self.entry_price / exit_price - 1) * 100
             
-            logging.info(f"[{self.symbol}] 포지션 청산: {reason} @ {exit_price:.6f} PnL:{pnl_pct:+.2f}%")
+            logging.info(f"[{self.symbol}] ✅ 포지션 청산: {reason} @ {exit_price:.6f} PnL:{pnl_pct:+.2f}%")
             
             # 상태 초기화
             self.is_active = False
@@ -469,7 +529,7 @@ class PositionManager:
             return True
             
         except Exception as e:
-            logging.error(f"[{self.symbol}] 청산 실패: {e}")
+            logging.error(f"[{self.symbol}] ❌ 청산 실패: {e}")
             return False
 
 # ==============================================================================
@@ -615,6 +675,10 @@ class TradingBot:
             'options': {'defaultType': 'swap'}
         })
         
+        # 마켓 정보 로드
+        logging.info("마켓 정보 로딩...")
+        self.exchange.load_markets()
+        
         # Google Sheets 연결
         if not self.sheets_manager.connect():
             logging.error("Google Sheets 연결 실패!")
@@ -733,7 +797,7 @@ class TradingBot:
     
     async def run(self):
         """메인 실행"""
-        global coin_configs
+        global coin_configs, is_running
         
         # 웹소켓 설정
         self.websocket = BitgetWebSocket(
@@ -789,7 +853,8 @@ class TradingBot:
 # ==============================================================================
 def main():
     logging.info("="*70)
-    logging.info("  Bitget Bot v24 - 웹소켓 + Google Sheets")
+    logging.info("  Bitget Bot v24.1 - 웹소켓 + Google Sheets")
+    logging.info("  수량 계산 에러 수정 버전")
     logging.info("="*70)
     
     bot = TradingBot()
@@ -804,6 +869,8 @@ def main():
         logging.info("봇 종료...")
     except Exception as e:
         logging.error(f"치명적 에러: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
         sys.exit(1)
 
 if __name__ == '__main__':
