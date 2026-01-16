@@ -1,12 +1,13 @@
 """
-Bitget Bot v24 - 웹소켓 + Google Sheets 연동 버전
+Bitget Bot v24.2 - 웹소켓 + Google Sheets + 동기화 모드
 - 실시간 캔들 데이터 수신 (웹소켓)
 - Google Sheets에서 코인별 설정 읽기
+- 동기화 모드: 가상 포지션으로 실시간 테스트와 맞춤
 - 최대 20개 코인 동시 운영
 - Supertrend + Engulfing 패턴 전략
 - Risk-Free Trailing Stop
 
-v24.1 - 수량 계산 에러 수정
+v24.2 - 동기화 모드 추가
 """
 
 import ccxt
@@ -53,14 +54,9 @@ if not BITGET_API_KEY or not BITGET_SECRET_KEY or not BITGET_PASSPHRASE:
 # ==============================================================================
 # [전역 변수]
 # ==============================================================================
-# 코인별 데이터 저장
-candle_data = defaultdict(list)  # {symbol: [candles]}
-position_data = {}  # {symbol: position_info}
-coin_configs = {}  # {symbol: config_from_sheets}
-
-# 봇 상태
+candle_data = defaultdict(list)
+coin_configs = {}
 is_running = True
-exchange = None
 
 # ==============================================================================
 # [Google Sheets 연동]
@@ -70,16 +66,14 @@ class GoogleSheetsManager:
         self.client = None
         self.sheet = None
         self.last_fetch_time = None
-        self.cache_duration = 60  # 60초마다 갱신
+        self.cache_duration = 60
         
     def connect(self):
         """Google Sheets 연결"""
         try:
             if GOOGLE_CREDENTIALS:
-                # 환경변수에서 JSON 읽기
                 creds_dict = json.loads(GOOGLE_CREDENTIALS)
             else:
-                # 로컬 파일에서 읽기 (테스트용)
                 if os.path.exists('google_credentials.json'):
                     with open('google_credentials.json', 'r') as f:
                         creds_dict = json.load(f)
@@ -109,21 +103,32 @@ class GoogleSheetsManager:
         
         now = datetime.now()
         
-        # 캐시된 데이터 사용
         if not force_refresh and self.last_fetch_time:
             if (now - self.last_fetch_time).total_seconds() < self.cache_duration:
                 return coin_configs
         
         try:
-            # 모든 데이터 읽기
             all_data = self.sheet.get_all_records()
             
             new_configs = {}
             for row in all_data:
-                # 활성화된 코인만
                 if str(row.get('활성화', 'N')).upper() == 'Y':
                     symbol = row.get('거래쌍', '')
                     if symbol:
+                        # 현재상태 읽기 (WAITING, SYNC_LONG, SYNC_SHORT)
+                        status = str(row.get('현재상태', 'WAITING')).upper().strip()
+                        if status not in ['WAITING', 'SYNC_LONG', 'SYNC_SHORT']:
+                            status = 'WAITING'
+                        
+                        # 동기화 진입가 읽기
+                        sync_entry_raw = row.get('동기화진입가', '')
+                        sync_entry = 0.0
+                        if sync_entry_raw and str(sync_entry_raw).strip():
+                            try:
+                                sync_entry = float(sync_entry_raw)
+                            except:
+                                sync_entry = 0.0
+                        
                         new_configs[symbol] = {
                             'name': row.get('코인명', ''),
                             'symbol': symbol,
@@ -135,10 +140,13 @@ class GoogleSheetsManager:
                             'atr_multiplier': float(row.get('슈퍼트렌드 배수', 8.1)),
                             'timeframe': row.get('진입시간봉', '3m'),
                             'entry_condition': row.get('진입조건', ''),
-                            'capital': 30.0,  # 기본값
-                            'leverage': 1
+                            'capital': 30.0,
+                            'leverage': 1,
+                            # 동기화 관련
+                            'status': status,
+                            'sync_entry_price': sync_entry
                         }
-                        logging.info(f"코인 로드: {symbol} (활성화)")
+                        logging.info(f"코인 로드: {symbol} | 상태:{status} | 동기화진입가:{sync_entry}")
             
             coin_configs = new_configs
             self.last_fetch_time = now
@@ -150,43 +158,50 @@ class GoogleSheetsManager:
             logging.error(f"시트 읽기 실패: {e}")
             return coin_configs
     
-    def update_position_status(self, symbol, status, entry_price=None, current_sl=None):
-        """시트에 포지션 상태 업데이트 (선택사항)"""
-        # 필요시 구현
-        pass
+    def update_status(self, symbol, new_status):
+        """시트의 현재상태 업데이트"""
+        try:
+            # 심볼로 행 찾기
+            all_data = self.sheet.get_all_records()
+            for idx, row in enumerate(all_data):
+                if row.get('거래쌍', '') == symbol:
+                    # 현재상태 열 찾기 (헤더 기준)
+                    headers = self.sheet.row_values(1)
+                    if '현재상태' in headers:
+                        col_idx = headers.index('현재상태') + 1
+                        row_idx = idx + 2  # 헤더가 1행이므로 +2
+                        self.sheet.update_cell(row_idx, col_idx, new_status)
+                        logging.info(f"[{symbol}] 시트 상태 업데이트: {new_status}")
+                    return True
+            return False
+        except Exception as e:
+            logging.error(f"시트 업데이트 실패: {e}")
+            return False
 
 # ==============================================================================
 # [Supertrend 계산]
 # ==============================================================================
 def calculate_supertrend(candles, atr_period, multiplier):
-    """
-    Supertrend 계산
-    candles: [(timestamp, open, high, low, close, volume), ...]
-    """
     if len(candles) < atr_period + 10:
         return None, None
     
-    # numpy 배열로 변환
     data = np.array(candles, dtype=np.float64)
     high = data[:, 2]
     low = data[:, 3]
     close = data[:, 4]
     n = len(close)
     
-    # TR 계산
     tr = np.zeros(n)
     tr[0] = high[0] - low[0]
     for i in range(1, n):
         tr[i] = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1]))
     
-    # ATR (EMA 방식)
     atr = np.zeros(n)
     atr[0] = tr[0]
     alpha = 1.0 / atr_period
     for i in range(1, n):
         atr[i] = alpha * tr[i] + (1 - alpha) * atr[i-1]
     
-    # Supertrend 계산
     hl2 = (high + low) / 2
     upper = hl2 + multiplier * atr
     lower = hl2 - multiplier * atr
@@ -224,36 +239,29 @@ def calculate_supertrend(candles, atr_period, multiplier):
 # [캔들 패턴 감지]
 # ==============================================================================
 def detect_engulfing(candles):
-    """
-    Engulfing 패턴 감지
-    Returns: 'bullish', 'bearish', or None
-    """
     if len(candles) < 3:
         return None
     
-    # 마지막 완성된 캔들 기준 ([-2]가 신호 캔들, [-1]은 현재 진행 중)
-    prev_candle = candles[-3]  # 이전 캔들
-    signal_candle = candles[-2]  # 신호 캔들
+    prev_candle = candles[-3]
+    signal_candle = candles[-2]
     
     prev_open = prev_candle[1]
     prev_close = prev_candle[4]
     curr_open = signal_candle[1]
     curr_close = signal_candle[4]
     
-    # Bullish Engulfing
     is_bullish = (
-        prev_close < prev_open and  # 이전 음봉
-        curr_close > curr_open and  # 현재 양봉
-        curr_close > prev_open and  # 현재 종가 > 이전 시가
-        curr_open <= prev_close     # 현재 시가 <= 이전 종가
+        prev_close < prev_open and
+        curr_close > curr_open and
+        curr_close > prev_open and
+        curr_open <= prev_close
     )
     
-    # Bearish Engulfing
     is_bearish = (
-        prev_close > prev_open and  # 이전 양봉
-        curr_close < curr_open and  # 현재 음봉
-        curr_open >= prev_close and # 현재 시가 >= 이전 종가
-        curr_close < prev_open      # 현재 종가 < 이전 시가
+        prev_close > prev_open and
+        curr_close < curr_open and
+        curr_open >= prev_close and
+        curr_close < prev_open
     )
     
     if is_bullish:
@@ -266,9 +274,6 @@ def detect_engulfing(candles):
 # [신호 생성]
 # ==============================================================================
 def generate_signal(symbol, config):
-    """
-    특정 코인의 신호 생성
-    """
     global candle_data
     
     candles = candle_data.get(symbol, [])
@@ -276,7 +281,6 @@ def generate_signal(symbol, config):
     if len(candles) < 100:
         return None, None
     
-    # Supertrend 계산
     current_trend, prev_trend = calculate_supertrend(
         candles, 
         config['atr_period'], 
@@ -286,22 +290,17 @@ def generate_signal(symbol, config):
     if current_trend is None:
         return None, None
     
-    # 패턴 감지
     pattern = detect_engulfing(candles)
     
     if pattern is None:
         return None, None
     
-    # 다음 캔들 시가 (현재 캔들)
-    entry_price = candles[-1][1]  # 현재 캔들 시가
+    entry_price = candles[-1][1]
     
-    # 신호 판단
-    # LONG: 상승 트렌드 + Bullish Engulfing
     if current_trend == 1 and pattern == 'bullish':
         logging.info(f"[{symbol}] LONG 신호! 트렌드:상승 패턴:Bullish @ {entry_price}")
         return 'long', entry_price
     
-    # SHORT: 하락 트렌드 + Bearish Engulfing
     if current_trend == -1 and pattern == 'bearish':
         logging.info(f"[{symbol}] SHORT 신호! 트렌드:하락 패턴:Bearish @ {entry_price}")
         return 'short', entry_price
@@ -309,57 +308,187 @@ def generate_signal(symbol, config):
     return None, None
 
 # ==============================================================================
-# [정밀도 헬퍼 함수]
+# [정밀도 헬퍼]
 # ==============================================================================
 def get_precision(exchange, symbol):
-    """거래소에서 정밀도 가져오기 (안전하게)"""
     try:
         market = exchange.market(symbol)
-        
-        # 가격 정밀도
         price_prec = market.get('precision', {}).get('price')
         if price_prec is None or price_prec <= 0 or price_prec > 8:
             price_prec = 4
-        
-        # 수량 정밀도
         amount_prec = market.get('precision', {}).get('amount')
         if amount_prec is None or amount_prec <= 0 or amount_prec > 8:
             amount_prec = 2
-        
         return int(price_prec), int(amount_prec)
-    except Exception as e:
-        logging.warning(f"정밀도 조회 실패: {e}, 기본값 사용")
+    except:
         return 4, 2
 
 def truncate(value, precision):
-    """소수점 자르기 (안전하게)"""
     if value is None or precision is None:
         return 0
-    
     try:
-        precision = max(0, min(int(precision), 8))  # 0~8 사이로 제한
+        precision = max(0, min(int(precision), 8))
         factor = 10 ** precision
         return int(float(value) * factor) / factor
     except:
         return 0
 
 # ==============================================================================
-# [포지션 관리 클래스]
+# [가상 포지션 관리 - 동기화 모드용]
 # ==============================================================================
-class PositionManager:
+class VirtualPositionManager:
+    """동기화 모드: 실제 거래 없이 가상으로 포지션 추적"""
+    
+    def __init__(self, symbol, config, sheets_manager):
+        self.symbol = symbol
+        self.config = config
+        self.sheets_manager = sheets_manager
+        
+        self.side = None
+        self.entry_price = 0
+        self.current_sl = 0
+        self.trailing_active = False
+        self.extreme_price = 0
+        self.is_active = False
+        self._last_log_time = 0
+        
+    def start_sync(self, side, entry_price):
+        """동기화 시작 (가상 포지션 진입)"""
+        self.side = side
+        self.entry_price = entry_price
+        self.trailing_active = False
+        
+        sl_pct = self.config['stop_loss_pct'] / 100
+        if side == 'long':
+            self.current_sl = entry_price * (1 - sl_pct)
+            self.extreme_price = entry_price
+        else:
+            self.current_sl = entry_price * (1 + sl_pct)
+            self.extreme_price = entry_price
+        
+        self.is_active = True
+        
+        logging.info("━" * 60)
+        logging.info(f"[{self.symbol}] 🔄 동기화 시작 (가상 포지션)")
+        logging.info(f"  방향: {side.upper()}")
+        logging.info(f"  진입가: {entry_price:.6f}")
+        logging.info(f"  초기 SL: {self.current_sl:.6f}")
+        logging.info("━" * 60)
+        
+    def check_and_update(self, current_price):
+        """가격 업데이트 및 가상 청산 체크"""
+        if not self.is_active:
+            return False, None
+        
+        if current_price is None or current_price <= 0:
+            return False, None
+        
+        # 주기적 상태 로깅 (60초마다)
+        now = time.time()
+        if now - self._last_log_time > 60:
+            status = "BE활성" if self.trailing_active else "대기"
+            logging.info(f"[{self.symbol}] [가상] 현재가:{current_price:.4f} | SL:{self.current_sl:.4f} | {status}")
+            self._last_log_time = now
+        
+        trigger_pct = self.config['trailing_trigger_pct'] / 100
+        gap_pct = self.config['trailing_gap_pct'] / 100
+        be_buffer = self.config['be_buffer_pct'] / 100
+        
+        should_close = False
+        close_reason = ""
+        
+        if self.side == 'long':
+            if not self.trailing_active:
+                if current_price >= self.entry_price * (1 + trigger_pct):
+                    self.trailing_active = True
+                    be_price = self.entry_price * (1 + be_buffer)
+                    if self.current_sl < be_price:
+                        self.current_sl = be_price
+                    self.extreme_price = current_price
+                    logging.info(f"[{self.symbol}] [가상] Risk-Free 활성화! BE:{be_price:.6f}")
+            
+            if self.trailing_active:
+                if current_price > self.extreme_price:
+                    self.extreme_price = current_price
+                    new_sl = self.extreme_price * (1 - gap_pct)
+                    if new_sl > self.current_sl:
+                        self.current_sl = new_sl
+            
+            if current_price <= self.current_sl:
+                should_close = True
+                close_reason = "Risk-Free" if self.trailing_active else "SL"
+        
+        else:  # short
+            if not self.trailing_active:
+                if current_price <= self.entry_price * (1 - trigger_pct):
+                    self.trailing_active = True
+                    be_price = self.entry_price * (1 - be_buffer)
+                    if self.current_sl > be_price:
+                        self.current_sl = be_price
+                    self.extreme_price = current_price
+                    logging.info(f"[{self.symbol}] [가상] Risk-Free 활성화! BE:{be_price:.6f}")
+            
+            if self.trailing_active:
+                if current_price < self.extreme_price:
+                    self.extreme_price = current_price
+                    new_sl = self.extreme_price * (1 + gap_pct)
+                    if new_sl < self.current_sl:
+                        self.current_sl = new_sl
+            
+            if current_price >= self.current_sl:
+                should_close = True
+                close_reason = "Risk-Free" if self.trailing_active else "SL"
+        
+        if should_close:
+            self._close_virtual(close_reason, current_price)
+            return True, close_reason
+        
+        return False, None
+    
+    def _close_virtual(self, reason, exit_price):
+        """가상 포지션 청산"""
+        if self.side == 'long':
+            pnl_pct = (exit_price / self.entry_price - 1) * 100
+        else:
+            pnl_pct = (self.entry_price / exit_price - 1) * 100
+        
+        logging.info("━" * 60)
+        logging.info(f"[{self.symbol}] 🔄 동기화 완료 (가상 청산)")
+        logging.info(f"  방향: {self.side.upper()}")
+        logging.info(f"  진입가: {self.entry_price:.6f} → 청산가: {exit_price:.6f}")
+        logging.info(f"  사유: {reason}")
+        logging.info(f"  가상 수익률: {pnl_pct:+.2f}% (실제 거래 없음)")
+        logging.info(f"  → 다음 신호부터 실전 모드 전환")
+        logging.info("━" * 60)
+        
+        # 시트 상태 업데이트
+        self.sheets_manager.update_status(self.symbol, 'WAITING')
+        
+        # 상태 초기화
+        self.is_active = False
+        self.side = None
+        self.entry_price = 0
+        self.trailing_active = False
+
+# ==============================================================================
+# [실제 포지션 관리]
+# ==============================================================================
+class RealPositionManager:
+    """실전 모드: 실제 거래 실행"""
+    
     def __init__(self, exchange, symbol, config):
         self.exchange = exchange
         self.symbol = symbol
         self.config = config
         
-        self.side = None  # 'long' or 'short'
+        self.side = None
         self.entry_price = 0
         self.current_sl = 0
         self.qty = 0
         self.trailing_active = False
         self.extreme_price = 0
-        
         self.is_active = False
+        self._last_log_time = 0
         
     def open_position(self, side, entry_price):
         """포지션 진입"""
@@ -367,10 +496,8 @@ class PositionManager:
             capital = self.config.get('capital', 30.0)
             leverage = self.config.get('leverage', 1)
             
-            # 정밀도 가져오기 (안전하게)
             price_prec, amount_prec = get_precision(self.exchange, self.symbol)
             
-            # 수량 계산
             if entry_price is None or entry_price <= 0:
                 logging.error(f"[{self.symbol}] 잘못된 진입가: {entry_price}")
                 return False
@@ -379,38 +506,32 @@ class PositionManager:
             qty = truncate(qty_raw, amount_prec)
             
             if qty <= 0:
-                logging.error(f"[{self.symbol}] 계산된 수량이 0 이하: {qty_raw} -> {qty}")
+                logging.error(f"[{self.symbol}] 수량 계산 오류: {qty}")
                 return False
             
             logging.info(f"[{self.symbol}] 주문 준비: {side.upper()} qty={qty} @ {entry_price}")
             
-            # 레버리지 설정
             try:
                 self.exchange.set_leverage(leverage, self.symbol)
             except Exception as e:
                 logging.warning(f"[{self.symbol}] 레버리지 설정 실패 (무시): {e}")
             
-            # 주문 실행
             order_side = 'buy' if side == 'long' else 'sell'
             order = self.exchange.create_market_order(self.symbol, order_side, qty)
             
-            # 실제 체결가
             actual_entry = order.get('average')
             if actual_entry is None:
-                # 체결가를 못 가져오면 현재 가격 사용
                 time.sleep(0.5)
                 ticker = self.exchange.fetch_ticker(self.symbol)
                 actual_entry = ticker.get('last', entry_price)
             
             actual_entry = float(actual_entry)
             
-            # 포지션 정보 저장
             self.side = side
             self.entry_price = actual_entry
             self.qty = qty
             self.trailing_active = False
             
-            # 초기 SL 설정
             sl_pct = self.config['stop_loss_pct'] / 100
             if side == 'long':
                 self.current_sl = actual_entry * (1 - sl_pct)
@@ -421,7 +542,7 @@ class PositionManager:
             
             self.is_active = True
             
-            logging.info(f"[{self.symbol}] ✅ 포지션 오픈 성공: {side.upper()} @ {actual_entry:.6f} SL:{self.current_sl:.6f}")
+            logging.info(f"[{self.symbol}] ✅ 포지션 오픈: {side.upper()} @ {actual_entry:.6f} SL:{self.current_sl:.6f}")
             
             return True
             
@@ -439,6 +560,14 @@ class PositionManager:
         if current_price is None or current_price <= 0:
             return False
         
+        # 주기적 상태 로깅 (30초마다)
+        now = time.time()
+        if now - self._last_log_time > 30:
+            status = "BE활성" if self.trailing_active else "대기"
+            pnl = ((current_price / self.entry_price - 1) * 100) if self.side == 'long' else ((self.entry_price / current_price - 1) * 100)
+            logging.info(f"[{self.symbol}] 현재가:{current_price:.4f} | PnL:{pnl:+.2f}% | SL:{self.current_sl:.4f} | {status}")
+            self._last_log_time = now
+        
         trigger_pct = self.config['trailing_trigger_pct'] / 100
         gap_pct = self.config['trailing_gap_pct'] / 100
         be_buffer = self.config['be_buffer_pct'] / 100
@@ -447,7 +576,6 @@ class PositionManager:
         close_reason = ""
         
         if self.side == 'long':
-            # 트레일링 트리거 체크
             if not self.trailing_active:
                 if current_price >= self.entry_price * (1 + trigger_pct):
                     self.trailing_active = True
@@ -457,7 +585,6 @@ class PositionManager:
                     self.extreme_price = current_price
                     logging.info(f"[{self.symbol}] Risk-Free 활성화! BE:{be_price:.6f}")
             
-            # 트레일링 SL 업데이트
             if self.trailing_active:
                 if current_price > self.extreme_price:
                     self.extreme_price = current_price
@@ -465,13 +592,11 @@ class PositionManager:
                     if new_sl > self.current_sl:
                         self.current_sl = new_sl
             
-            # 청산 체크
             if current_price <= self.current_sl:
                 should_close = True
                 close_reason = "Risk-Free" if self.trailing_active else "SL"
         
-        else:  # short
-            # 트레일링 트리거 체크
+        else:
             if not self.trailing_active:
                 if current_price <= self.entry_price * (1 - trigger_pct):
                     self.trailing_active = True
@@ -481,7 +606,6 @@ class PositionManager:
                     self.extreme_price = current_price
                     logging.info(f"[{self.symbol}] Risk-Free 활성화! BE:{be_price:.6f}")
             
-            # 트레일링 SL 업데이트
             if self.trailing_active:
                 if current_price < self.extreme_price:
                     self.extreme_price = current_price
@@ -489,7 +613,6 @@ class PositionManager:
                     if new_sl < self.current_sl:
                         self.current_sl = new_sl
             
-            # 청산 체크
             if current_price >= self.current_sl:
                 should_close = True
                 close_reason = "Risk-Free" if self.trailing_active else "SL"
@@ -511,7 +634,6 @@ class PositionManager:
                 params={'reduceOnly': True}
             )
             
-            # PnL 계산
             if self.side == 'long':
                 pnl_pct = (exit_price / self.entry_price - 1) * 100
             else:
@@ -519,7 +641,6 @@ class PositionManager:
             
             logging.info(f"[{self.symbol}] ✅ 포지션 청산: {reason} @ {exit_price:.6f} PnL:{pnl_pct:+.2f}%")
             
-            # 상태 초기화
             self.is_active = False
             self.side = None
             self.entry_price = 0
@@ -545,7 +666,6 @@ class BitgetWebSocket:
         self.is_connected = False
         
     async def connect(self):
-        """웹소켓 연결"""
         try:
             self.ws = await websockets.connect(
                 self.ws_url,
@@ -560,24 +680,20 @@ class BitgetWebSocket:
             return False
     
     async def subscribe(self, symbols, timeframe='3m'):
-        """캔들 구독"""
         if not self.ws:
             return False
         
         subscribe_args = []
         
         for symbol in symbols:
-            # LINK/USDT:USDT -> LINKUSDT
             clean_symbol = symbol.replace('/USDT:USDT', 'USDT')
             
-            # 캔들 구독
             subscribe_args.append({
                 "instType": "USDT-FUTURES",
                 "channel": f"candle{timeframe}",
                 "instId": clean_symbol
             })
             
-            # 틱 가격 구독 (포지션 모니터링용)
             subscribe_args.append({
                 "instType": "USDT-FUTURES",
                 "channel": "ticker",
@@ -597,40 +713,33 @@ class BitgetWebSocket:
         return True
     
     async def listen(self):
-        """메시지 수신 루프"""
         while self.is_connected:
             try:
                 message = await asyncio.wait_for(self.ws.recv(), timeout=30)
                 data = json.loads(message)
                 
-                # 응답 처리
                 if 'event' in data:
                     if data['event'] == 'subscribe':
                         logging.info(f"구독 확인: {data.get('arg', {})}")
                     continue
                 
-                # 데이터 처리
                 if 'data' in data and 'arg' in data:
                     channel = data['arg'].get('channel', '')
                     inst_id = data['arg'].get('instId', '')
                     
-                    # LINKUSDT -> LINK/USDT:USDT
                     symbol = inst_id.replace('USDT', '/USDT:USDT')
                     
                     if channel.startswith('candle'):
-                        # 캔들 데이터
                         for candle in data['data']:
                             self.on_candle(symbol, candle)
                     
                     elif channel == 'ticker':
-                        # 틱 가격
                         for tick in data['data']:
                             price = float(tick.get('lastPr', 0))
                             if price > 0:
                                 self.on_price(symbol, price)
                 
             except asyncio.TimeoutError:
-                # 연결 유지를 위한 ping
                 try:
                     await self.ws.send('ping')
                 except:
@@ -640,7 +749,6 @@ class BitgetWebSocket:
                 self.is_connected = False
                 await asyncio.sleep(5)
                 await self.connect()
-                # 재구독
                 if self.subscribed_symbols:
                     await self.subscribe(list(self.subscribed_symbols))
             except Exception as e:
@@ -648,7 +756,6 @@ class BitgetWebSocket:
                 await asyncio.sleep(1)
     
     async def close(self):
-        """연결 종료"""
         self.is_connected = False
         if self.ws:
             await self.ws.close()
@@ -661,11 +768,14 @@ class TradingBot:
         self.exchange = None
         self.sheets_manager = GoogleSheetsManager()
         self.websocket = None
-        self.position_managers = {}  # {symbol: PositionManager}
-        self.last_signal_time = {}   # {symbol: datetime}
+        
+        # 코인별 매니저
+        self.virtual_managers = {}   # 동기화 모드용 (가상)
+        self.real_managers = {}      # 실전 모드용 (실제)
+        
+        self.last_signal_time = {}
         
     def initialize(self):
-        """초기화"""
         # Exchange 연결
         self.exchange = ccxt.bitget({
             'apiKey': BITGET_API_KEY,
@@ -675,7 +785,6 @@ class TradingBot:
             'options': {'defaultType': 'swap'}
         })
         
-        # 마켓 정보 로드
         logging.info("마켓 정보 로딩...")
         self.exchange.load_markets()
         
@@ -690,38 +799,44 @@ class TradingBot:
             logging.error("활성화된 코인이 없습니다!")
             return False
         
-        # 초기 캔들 데이터 로드
+        # 코인별 초기화
         for symbol, config in configs.items():
             self._load_initial_candles(symbol, config)
-            self.position_managers[symbol] = PositionManager(self.exchange, symbol, config)
+            
+            # 매니저 생성
+            self.real_managers[symbol] = RealPositionManager(self.exchange, symbol, config)
+            self.virtual_managers[symbol] = VirtualPositionManager(symbol, config, self.sheets_manager)
+            
+            # 동기화 모드면 가상 포지션 시작
+            status = config.get('status', 'WAITING')
+            sync_entry = config.get('sync_entry_price', 0)
+            
+            if status == 'SYNC_LONG' and sync_entry > 0:
+                self.virtual_managers[symbol].start_sync('long', sync_entry)
+            elif status == 'SYNC_SHORT' and sync_entry > 0:
+                self.virtual_managers[symbol].start_sync('short', sync_entry)
         
         logging.info(f"초기화 완료! {len(configs)}개 코인 준비됨")
         return True
     
     def _load_initial_candles(self, symbol, config):
-        """초기 캔들 데이터 로드 (Supertrend 계산용)"""
         global candle_data
         
         try:
             timeframe = config.get('timeframe', '3m')
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=500)
-            
-            # [(timestamp, open, high, low, close, volume), ...]
             candle_data[symbol] = ohlcv
             logging.info(f"[{symbol}] 초기 캔들 {len(ohlcv)}개 로드")
-            
         except Exception as e:
             logging.error(f"[{symbol}] 초기 캔들 로드 실패: {e}")
     
     def on_candle_update(self, symbol, candle_raw):
-        """새 캔들 수신 콜백"""
         global candle_data, coin_configs
         
         if symbol not in coin_configs:
             return
         
         try:
-            # Bitget 웹소켓 캔들 포맷: [timestamp, open, high, low, close, volume, ...]
             ts = int(candle_raw[0])
             o = float(candle_raw[1])
             h = float(candle_raw[2])
@@ -730,55 +845,68 @@ class TradingBot:
             v = float(candle_raw[5]) if len(candle_raw) > 5 else 0
             
             candle = [ts, o, h, l, c, v]
-            
-            # 기존 캔들 업데이트 또는 추가
             candles = candle_data.get(symbol, [])
             
             if candles and candles[-1][0] == ts:
-                # 같은 타임스탬프면 업데이트
                 candles[-1] = candle
             else:
-                # 새 캔들이면 추가
                 candles.append(candle)
                 
-                # 최대 1000개 유지
                 if len(candles) > 1000:
                     candles = candles[-1000:]
                 
                 candle_data[symbol] = candles
                 
-                # 새 캔들 완성 = 신호 체크
+                # 새 캔들 = 신호 체크
                 self._check_signal(symbol)
                 
         except Exception as e:
             logging.error(f"[{symbol}] 캔들 처리 에러: {e}")
     
     def on_price_update(self, symbol, price):
-        """가격 업데이트 콜백 (포지션 모니터링)"""
-        if symbol not in self.position_managers:
-            return
+        """가격 업데이트 - 가상/실제 포지션 모두 체크"""
         
-        pm = self.position_managers[symbol]
-        if pm.is_active:
-            pm.check_and_update(price)
+        # 1. 가상 포지션 체크 (동기화 모드)
+        if symbol in self.virtual_managers:
+            vm = self.virtual_managers[symbol]
+            if vm.is_active:
+                closed, reason = vm.check_and_update(price)
+                if closed:
+                    # 동기화 완료됨 → config 상태 업데이트
+                    if symbol in coin_configs:
+                        coin_configs[symbol]['status'] = 'WAITING'
+        
+        # 2. 실제 포지션 체크
+        if symbol in self.real_managers:
+            rm = self.real_managers[symbol]
+            if rm.is_active:
+                rm.check_and_update(price)
     
     def _check_signal(self, symbol):
-        """신호 체크 및 진입"""
         global coin_configs
         
         config = coin_configs.get(symbol)
         if not config:
             return
         
-        pm = self.position_managers.get(symbol)
-        if not pm:
+        # 동기화 모드 중이면 신호 무시
+        vm = self.virtual_managers.get(symbol)
+        if vm and vm.is_active:
             return
         
-        # 이미 포지션이 있으면 스킵
-        if pm.is_active:
+        # 실제 포지션 있으면 신호 무시
+        rm = self.real_managers.get(symbol)
+        if not rm:
+            return
+        if rm.is_active:
             return
         
-        # 쿨다운 체크 (같은 코인 연속 진입 방지, 3분)
+        # 상태가 WAITING이 아니면 스킵
+        status = config.get('status', 'WAITING')
+        if status != 'WAITING':
+            return
+        
+        # 쿨다운 체크 (3분)
         now = datetime.now()
         last_time = self.last_signal_time.get(symbol)
         if last_time and (now - last_time).total_seconds() < 180:
@@ -790,58 +918,75 @@ class TradingBot:
         if signal:
             logging.info(f"[{symbol}] 진입 시도: {signal.upper()} @ {entry_price}")
             
-            success = pm.open_position(signal, entry_price)
+            success = rm.open_position(signal, entry_price)
             
             if success:
                 self.last_signal_time[symbol] = now
     
     async def run(self):
-        """메인 실행"""
         global coin_configs, is_running
         
-        # 웹소켓 설정
         self.websocket = BitgetWebSocket(
             on_candle_callback=self.on_candle_update,
             on_price_callback=self.on_price_update
         )
         
-        # 연결
         if not await self.websocket.connect():
             logging.error("웹소켓 연결 실패!")
             return
         
-        # 구독
         symbols = list(coin_configs.keys())
         await self.websocket.subscribe(symbols)
         
-        # 설정 주기적 갱신 태스크
+        # 설정 주기적 갱신
         async def refresh_configs():
             while is_running:
                 await asyncio.sleep(60)
                 try:
+                    old_configs = coin_configs.copy()
                     new_configs = self.sheets_manager.get_coin_configs(force_refresh=True)
                     
-                    # 새로 추가된 코인 처리
-                    for symbol in new_configs:
-                        if symbol not in self.position_managers:
-                            self._load_initial_candles(symbol, new_configs[symbol])
-                            self.position_managers[symbol] = PositionManager(
-                                self.exchange, symbol, new_configs[symbol]
+                    for symbol, config in new_configs.items():
+                        # 새로 추가된 코인
+                        if symbol not in self.real_managers:
+                            self._load_initial_candles(symbol, config)
+                            self.real_managers[symbol] = RealPositionManager(
+                                self.exchange, symbol, config
+                            )
+                            self.virtual_managers[symbol] = VirtualPositionManager(
+                                symbol, config, self.sheets_manager
                             )
                             await self.websocket.subscribe([symbol])
                             logging.info(f"새 코인 추가: {symbol}")
+                        
+                        # 상태 변경 감지 (WAITING → SYNC_LONG/SHORT)
+                        old_status = old_configs.get(symbol, {}).get('status', 'WAITING')
+                        new_status = config.get('status', 'WAITING')
+                        sync_entry = config.get('sync_entry_price', 0)
+                        
+                        if old_status == 'WAITING' and new_status in ['SYNC_LONG', 'SYNC_SHORT']:
+                            if sync_entry > 0:
+                                side = 'long' if new_status == 'SYNC_LONG' else 'short'
+                                self.virtual_managers[symbol].start_sync(side, sync_entry)
+                        
+                        # 설정값 업데이트
+                        if symbol in self.real_managers:
+                            self.real_managers[symbol].config = config
+                        if symbol in self.virtual_managers:
+                            self.virtual_managers[symbol].config = config
+                            
                 except Exception as e:
                     logging.error(f"설정 갱신 에러: {e}")
         
-        # 상태 로깅 태스크
+        # 상태 로깅
         async def log_status():
             while is_running:
-                await asyncio.sleep(300)  # 5분마다
-                active = sum(1 for pm in self.position_managers.values() if pm.is_active)
-                total = len(self.position_managers)
-                logging.info(f"상태: {total}개 코인 모니터링 중 | 활성 포지션: {active}개")
+                await asyncio.sleep(300)
+                virtual_active = sum(1 for vm in self.virtual_managers.values() if vm.is_active)
+                real_active = sum(1 for rm in self.real_managers.values() if rm.is_active)
+                total = len(coin_configs)
+                logging.info(f"상태: {total}개 코인 | 동기화중:{virtual_active} | 실전포지션:{real_active}")
         
-        # 태스크 실행
         await asyncio.gather(
             self.websocket.listen(),
             refresh_configs(),
@@ -852,10 +997,9 @@ class TradingBot:
 # [실행]
 # ==============================================================================
 def main():
-    logging.info("="*70)
-    logging.info("  Bitget Bot v24.1 - 웹소켓 + Google Sheets")
-    logging.info("  수량 계산 에러 수정 버전")
-    logging.info("="*70)
+    logging.info("=" * 70)
+    logging.info("  Bitget Bot v24.2 - 웹소켓 + Google Sheets + 동기화 모드")
+    logging.info("=" * 70)
     
     bot = TradingBot()
     
