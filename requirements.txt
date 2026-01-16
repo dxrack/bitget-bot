@@ -1,4 +1,6 @@
-﻿ccxt
-pandas
-numpy
-numba
+ccxt==4.2.0
+websockets==12.0
+gspread==6.0.0
+google-auth==2.27.0
+numpy==1.26.4
+pandas==2.2.0
