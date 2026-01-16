@@ -1,13 +1,12 @@
 """
-Bitget Bot v24.2 - 웹소켓 + Google Sheets + 동기화 모드
+Bitget Bot v24.3 - 웹소켓 + Google Sheets + 동기화 모드 + 텔레그램
 - 실시간 캔들 데이터 수신 (웹소켓)
 - Google Sheets에서 코인별 설정 읽기
 - 동기화 모드: 가상 포지션으로 실시간 테스트와 맞춤
+- 텔레그램 알림: 진입/청산/동기화 알림
 - 최대 20개 코인 동시 운영
-- Supertrend + Engulfing 패턴 전략
-- Risk-Free Trailing Stop
 
-v24.2 - 동기화 모드 추가
+v24.3 - 텔레그램 알림 추가
 """
 
 import ccxt
@@ -18,15 +17,15 @@ import logging
 import os
 import sys
 import gspread
+import aiohttp
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from collections import defaultdict
 import numpy as np
-import threading
 import time
 
 # ==============================================================================
-# [로그 설정]  
+# [로그 설정]
 # ==============================================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -43,7 +42,7 @@ BITGET_PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', '')
 GOOGLE_SHEETS_ID = os.environ.get('GOOGLE_SHEETS_ID', '1fbPwI6F3hELseD1CKDktngR47jsvTvIAbwvfAa6RIsI')
 GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS', '')
 
-# 텔레그램 (선택사항)
+# 텔레그램
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
@@ -59,6 +58,64 @@ coin_configs = {}
 is_running = True
 
 # ==============================================================================
+# [텔레그램 알림]
+# ==============================================================================
+class TelegramNotifier:
+    def __init__(self):
+        self.token = TELEGRAM_TOKEN
+        self.chat_id = TELEGRAM_CHAT_ID
+        self.enabled = bool(self.token and self.chat_id)
+        
+        if self.enabled:
+            logging.info("텔레그램 알림 활성화됨")
+        else:
+            logging.info("텔레그램 알림 비활성화 (토큰/ChatID 없음)")
+    
+    async def send(self, message):
+        """비동기 텔레그램 메시지 전송"""
+        if not self.enabled:
+            return
+        
+        try:
+            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            payload = {
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=10) as resp:
+                    if resp.status == 200:
+                        logging.info(f"텔레그램 전송 완료")
+                    else:
+                        logging.warning(f"텔레그램 전송 실패: {resp.status}")
+        except Exception as e:
+            logging.error(f"텔레그램 에러: {e}")
+    
+    def send_sync(self, message):
+        """동기 텔레그램 메시지 전송 (asyncio 외부에서 사용)"""
+        if not self.enabled:
+            return
+        
+        try:
+            import requests
+            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            payload = {
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                logging.info(f"텔레그램 전송 완료")
+        except Exception as e:
+            logging.error(f"텔레그램 에러: {e}")
+
+# 전역 텔레그램 인스턴스
+telegram = TelegramNotifier()
+
+# ==============================================================================
 # [Google Sheets 연동]
 # ==============================================================================
 class GoogleSheetsManager:
@@ -69,7 +126,6 @@ class GoogleSheetsManager:
         self.cache_duration = 60
         
     def connect(self):
-        """Google Sheets 연결"""
         try:
             if GOOGLE_CREDENTIALS:
                 creds_dict = json.loads(GOOGLE_CREDENTIALS)
@@ -98,7 +154,6 @@ class GoogleSheetsManager:
             return False
     
     def get_coin_configs(self, force_refresh=False):
-        """시트에서 코인 설정 읽기"""
         global coin_configs
         
         now = datetime.now()
@@ -115,12 +170,10 @@ class GoogleSheetsManager:
                 if str(row.get('활성화', 'N')).upper() == 'Y':
                     symbol = row.get('거래쌍', '')
                     if symbol:
-                        # 현재상태 읽기 (WAITING, SYNC_LONG, SYNC_SHORT)
                         status = str(row.get('현재상태', 'WAITING')).upper().strip()
                         if status not in ['WAITING', 'SYNC_LONG', 'SYNC_SHORT']:
                             status = 'WAITING'
                         
-                        # 동기화 진입가 읽기
                         sync_entry_raw = row.get('동기화진입가', '')
                         sync_entry = 0.0
                         if sync_entry_raw and str(sync_entry_raw).strip():
@@ -142,7 +195,6 @@ class GoogleSheetsManager:
                             'entry_condition': row.get('진입조건', ''),
                             'capital': 30.0,
                             'leverage': 1,
-                            # 동기화 관련
                             'status': status,
                             'sync_entry_price': sync_entry
                         }
@@ -159,17 +211,14 @@ class GoogleSheetsManager:
             return coin_configs
     
     def update_status(self, symbol, new_status):
-        """시트의 현재상태 업데이트"""
         try:
-            # 심볼로 행 찾기
             all_data = self.sheet.get_all_records()
             for idx, row in enumerate(all_data):
                 if row.get('거래쌍', '') == symbol:
-                    # 현재상태 열 찾기 (헤더 기준)
                     headers = self.sheet.row_values(1)
                     if '현재상태' in headers:
                         col_idx = headers.index('현재상태') + 1
-                        row_idx = idx + 2  # 헤더가 1행이므로 +2
+                        row_idx = idx + 2
                         self.sheet.update_cell(row_idx, col_idx, new_status)
                         logging.info(f"[{symbol}] 시트 상태 업데이트: {new_status}")
                     return True
@@ -337,7 +386,6 @@ def truncate(value, precision):
 # [가상 포지션 관리 - 동기화 모드용]
 # ==============================================================================
 class VirtualPositionManager:
-    """동기화 모드: 실제 거래 없이 가상으로 포지션 추적"""
     
     def __init__(self, symbol, config, sheets_manager):
         self.symbol = symbol
@@ -353,7 +401,6 @@ class VirtualPositionManager:
         self._last_log_time = 0
         
     def start_sync(self, side, entry_price):
-        """동기화 시작 (가상 포지션 진입)"""
         self.side = side
         self.entry_price = entry_price
         self.trailing_active = False
@@ -368,6 +415,7 @@ class VirtualPositionManager:
         
         self.is_active = True
         
+        # 로그
         logging.info("━" * 60)
         logging.info(f"[{self.symbol}] 🔄 동기화 시작 (가상 포지션)")
         logging.info(f"  방향: {side.upper()}")
@@ -375,15 +423,22 @@ class VirtualPositionManager:
         logging.info(f"  초기 SL: {self.current_sl:.6f}")
         logging.info("━" * 60)
         
+        # 텔레그램 알림
+        name = self.config.get('name', self.symbol)
+        msg = f"🔄 <b>동기화 시작</b>\n\n"
+        msg += f"코인: {name}\n"
+        msg += f"방향: {side.upper()}\n"
+        msg += f"진입가: {entry_price:.4f}\n"
+        msg += f"초기 SL: {self.current_sl:.4f}"
+        telegram.send_sync(msg)
+        
     def check_and_update(self, current_price):
-        """가격 업데이트 및 가상 청산 체크"""
         if not self.is_active:
             return False, None
         
         if current_price is None or current_price <= 0:
             return False, None
         
-        # 주기적 상태 로깅 (60초마다)
         now = time.time()
         if now - self._last_log_time > 60:
             status = "BE활성" if self.trailing_active else "대기"
@@ -406,6 +461,13 @@ class VirtualPositionManager:
                         self.current_sl = be_price
                     self.extreme_price = current_price
                     logging.info(f"[{self.symbol}] [가상] Risk-Free 활성화! BE:{be_price:.6f}")
+                    
+                    # 텔레그램 알림
+                    name = self.config.get('name', self.symbol)
+                    msg = f"🛡️ <b>BE 활성화 (가상)</b>\n\n"
+                    msg += f"코인: {name}\n"
+                    msg += f"BE가: {be_price:.4f}"
+                    telegram.send_sync(msg)
             
             if self.trailing_active:
                 if current_price > self.extreme_price:
@@ -418,7 +480,7 @@ class VirtualPositionManager:
                 should_close = True
                 close_reason = "Risk-Free" if self.trailing_active else "SL"
         
-        else:  # short
+        else:
             if not self.trailing_active:
                 if current_price <= self.entry_price * (1 - trigger_pct):
                     self.trailing_active = True
@@ -427,6 +489,13 @@ class VirtualPositionManager:
                         self.current_sl = be_price
                     self.extreme_price = current_price
                     logging.info(f"[{self.symbol}] [가상] Risk-Free 활성화! BE:{be_price:.6f}")
+                    
+                    # 텔레그램 알림
+                    name = self.config.get('name', self.symbol)
+                    msg = f"🛡️ <b>BE 활성화 (가상)</b>\n\n"
+                    msg += f"코인: {name}\n"
+                    msg += f"BE가: {be_price:.4f}"
+                    telegram.send_sync(msg)
             
             if self.trailing_active:
                 if current_price < self.extreme_price:
@@ -446,12 +515,12 @@ class VirtualPositionManager:
         return False, None
     
     def _close_virtual(self, reason, exit_price):
-        """가상 포지션 청산"""
         if self.side == 'long':
             pnl_pct = (exit_price / self.entry_price - 1) * 100
         else:
             pnl_pct = (self.entry_price / exit_price - 1) * 100
         
+        # 로그
         logging.info("━" * 60)
         logging.info(f"[{self.symbol}] 🔄 동기화 완료 (가상 청산)")
         logging.info(f"  방향: {self.side.upper()}")
@@ -460,6 +529,19 @@ class VirtualPositionManager:
         logging.info(f"  가상 수익률: {pnl_pct:+.2f}% (실제 거래 없음)")
         logging.info(f"  → 다음 신호부터 실전 모드 전환")
         logging.info("━" * 60)
+        
+        # 텔레그램 알림
+        name = self.config.get('name', self.symbol)
+        emoji = "✅" if pnl_pct > 0 else "❌"
+        msg = f"{emoji} <b>동기화 완료</b>\n\n"
+        msg += f"코인: {name}\n"
+        msg += f"방향: {self.side.upper()}\n"
+        msg += f"진입: {self.entry_price:.4f}\n"
+        msg += f"청산: {exit_price:.4f}\n"
+        msg += f"사유: {reason}\n"
+        msg += f"가상 수익률: {pnl_pct:+.2f}%\n\n"
+        msg += f"→ 다음 신호부터 실전 진입!"
+        telegram.send_sync(msg)
         
         # 시트 상태 업데이트
         self.sheets_manager.update_status(self.symbol, 'WAITING')
@@ -474,7 +556,6 @@ class VirtualPositionManager:
 # [실제 포지션 관리]
 # ==============================================================================
 class RealPositionManager:
-    """실전 모드: 실제 거래 실행"""
     
     def __init__(self, exchange, symbol, config):
         self.exchange = exchange
@@ -491,7 +572,6 @@ class RealPositionManager:
         self._last_log_time = 0
         
     def open_position(self, side, entry_price):
-        """포지션 진입"""
         try:
             capital = self.config.get('capital', 30.0)
             leverage = self.config.get('leverage', 1)
@@ -544,6 +624,17 @@ class RealPositionManager:
             
             logging.info(f"[{self.symbol}] ✅ 포지션 오픈: {side.upper()} @ {actual_entry:.6f} SL:{self.current_sl:.6f}")
             
+            # 텔레그램 알림
+            name = self.config.get('name', self.symbol)
+            emoji = "🟢" if side == 'long' else "🔴"
+            msg = f"{emoji} <b>실전 진입</b>\n\n"
+            msg += f"코인: {name}\n"
+            msg += f"방향: {side.upper()}\n"
+            msg += f"진입가: {actual_entry:.4f}\n"
+            msg += f"수량: {qty}\n"
+            msg += f"초기 SL: {self.current_sl:.4f}"
+            telegram.send_sync(msg)
+            
             return True
             
         except Exception as e:
@@ -553,14 +644,12 @@ class RealPositionManager:
             return False
     
     def check_and_update(self, current_price):
-        """가격 업데이트 및 청산 체크"""
         if not self.is_active:
             return False
         
         if current_price is None or current_price <= 0:
             return False
         
-        # 주기적 상태 로깅 (30초마다)
         now = time.time()
         if now - self._last_log_time > 30:
             status = "BE활성" if self.trailing_active else "대기"
@@ -584,6 +673,13 @@ class RealPositionManager:
                         self.current_sl = be_price
                     self.extreme_price = current_price
                     logging.info(f"[{self.symbol}] Risk-Free 활성화! BE:{be_price:.6f}")
+                    
+                    # 텔레그램 알림
+                    name = self.config.get('name', self.symbol)
+                    msg = f"🛡️ <b>Risk-Free 활성화</b>\n\n"
+                    msg += f"코인: {name}\n"
+                    msg += f"BE가: {be_price:.4f}"
+                    telegram.send_sync(msg)
             
             if self.trailing_active:
                 if current_price > self.extreme_price:
@@ -605,6 +701,13 @@ class RealPositionManager:
                         self.current_sl = be_price
                     self.extreme_price = current_price
                     logging.info(f"[{self.symbol}] Risk-Free 활성화! BE:{be_price:.6f}")
+                    
+                    # 텔레그램 알림
+                    name = self.config.get('name', self.symbol)
+                    msg = f"🛡️ <b>Risk-Free 활성화</b>\n\n"
+                    msg += f"코인: {name}\n"
+                    msg += f"BE가: {be_price:.4f}"
+                    telegram.send_sync(msg)
             
             if self.trailing_active:
                 if current_price < self.extreme_price:
@@ -623,7 +726,6 @@ class RealPositionManager:
         return should_close
     
     def close_position(self, reason, exit_price):
-        """포지션 청산"""
         try:
             close_side = 'sell' if self.side == 'long' else 'buy'
             
@@ -640,6 +742,19 @@ class RealPositionManager:
                 pnl_pct = (self.entry_price / exit_price - 1) * 100
             
             logging.info(f"[{self.symbol}] ✅ 포지션 청산: {reason} @ {exit_price:.6f} PnL:{pnl_pct:+.2f}%")
+            
+            # 텔레그램 알림
+            name = self.config.get('name', self.symbol)
+            emoji = "💰" if pnl_pct > 0 else "💸"
+            result = "익절" if pnl_pct > 0 else "손절"
+            msg = f"{emoji} <b>포지션 청산</b>\n\n"
+            msg += f"코인: {name}\n"
+            msg += f"방향: {self.side.upper()}\n"
+            msg += f"진입: {self.entry_price:.4f}\n"
+            msg += f"청산: {exit_price:.4f}\n"
+            msg += f"사유: {reason}\n"
+            msg += f"결과: {result} {pnl_pct:+.2f}%"
+            telegram.send_sync(msg)
             
             self.is_active = False
             self.side = None
@@ -769,14 +884,12 @@ class TradingBot:
         self.sheets_manager = GoogleSheetsManager()
         self.websocket = None
         
-        # 코인별 매니저
-        self.virtual_managers = {}   # 동기화 모드용 (가상)
-        self.real_managers = {}      # 실전 모드용 (실제)
+        self.virtual_managers = {}
+        self.real_managers = {}
         
         self.last_signal_time = {}
         
     def initialize(self):
-        # Exchange 연결
         self.exchange = ccxt.bitget({
             'apiKey': BITGET_API_KEY,
             'secret': BITGET_SECRET_KEY,
@@ -788,26 +901,21 @@ class TradingBot:
         logging.info("마켓 정보 로딩...")
         self.exchange.load_markets()
         
-        # Google Sheets 연결
         if not self.sheets_manager.connect():
             logging.error("Google Sheets 연결 실패!")
             return False
         
-        # 코인 설정 로드
         configs = self.sheets_manager.get_coin_configs()
         if not configs:
             logging.error("활성화된 코인이 없습니다!")
             return False
         
-        # 코인별 초기화
         for symbol, config in configs.items():
             self._load_initial_candles(symbol, config)
             
-            # 매니저 생성
             self.real_managers[symbol] = RealPositionManager(self.exchange, symbol, config)
             self.virtual_managers[symbol] = VirtualPositionManager(symbol, config, self.sheets_manager)
             
-            # 동기화 모드면 가상 포지션 시작
             status = config.get('status', 'WAITING')
             sync_entry = config.get('sync_entry_price', 0)
             
@@ -817,6 +925,13 @@ class TradingBot:
                 self.virtual_managers[symbol].start_sync('short', sync_entry)
         
         logging.info(f"초기화 완료! {len(configs)}개 코인 준비됨")
+        
+        # 시작 알림
+        msg = f"🚀 <b>봇 시작</b>\n\n"
+        msg += f"버전: v24.3\n"
+        msg += f"코인: {len(configs)}개 활성화"
+        telegram.send_sync(msg)
+        
         return True
     
     def _load_initial_candles(self, symbol, config):
@@ -857,26 +972,20 @@ class TradingBot:
                 
                 candle_data[symbol] = candles
                 
-                # 새 캔들 = 신호 체크
                 self._check_signal(symbol)
                 
         except Exception as e:
             logging.error(f"[{symbol}] 캔들 처리 에러: {e}")
     
     def on_price_update(self, symbol, price):
-        """가격 업데이트 - 가상/실제 포지션 모두 체크"""
-        
-        # 1. 가상 포지션 체크 (동기화 모드)
         if symbol in self.virtual_managers:
             vm = self.virtual_managers[symbol]
             if vm.is_active:
                 closed, reason = vm.check_and_update(price)
                 if closed:
-                    # 동기화 완료됨 → config 상태 업데이트
                     if symbol in coin_configs:
                         coin_configs[symbol]['status'] = 'WAITING'
         
-        # 2. 실제 포지션 체크
         if symbol in self.real_managers:
             rm = self.real_managers[symbol]
             if rm.is_active:
@@ -889,30 +998,25 @@ class TradingBot:
         if not config:
             return
         
-        # 동기화 모드 중이면 신호 무시
         vm = self.virtual_managers.get(symbol)
         if vm and vm.is_active:
             return
         
-        # 실제 포지션 있으면 신호 무시
         rm = self.real_managers.get(symbol)
         if not rm:
             return
         if rm.is_active:
             return
         
-        # 상태가 WAITING이 아니면 스킵
         status = config.get('status', 'WAITING')
         if status != 'WAITING':
             return
         
-        # 쿨다운 체크 (3분)
         now = datetime.now()
         last_time = self.last_signal_time.get(symbol)
         if last_time and (now - last_time).total_seconds() < 180:
             return
         
-        # 신호 생성
         signal, entry_price = generate_signal(symbol, config)
         
         if signal:
@@ -938,7 +1042,6 @@ class TradingBot:
         symbols = list(coin_configs.keys())
         await self.websocket.subscribe(symbols)
         
-        # 설정 주기적 갱신
         async def refresh_configs():
             while is_running:
                 await asyncio.sleep(60)
@@ -947,7 +1050,6 @@ class TradingBot:
                     new_configs = self.sheets_manager.get_coin_configs(force_refresh=True)
                     
                     for symbol, config in new_configs.items():
-                        # 새로 추가된 코인
                         if symbol not in self.real_managers:
                             self._load_initial_candles(symbol, config)
                             self.real_managers[symbol] = RealPositionManager(
@@ -959,8 +1061,7 @@ class TradingBot:
                             await self.websocket.subscribe([symbol])
                             logging.info(f"새 코인 추가: {symbol}")
                         
-                        # 상태 변경 감지 (WAITING → SYNC_LONG/SHORT)
-                        old_status = old_configs.get(symbol, {}).get('status', 'WAITING')
+                        # SYNC 상태인데 가상 포지션이 안 켜져있으면 시작
                         new_status = config.get('status', 'WAITING')
                         sync_entry = config.get('sync_entry_price', 0)
                         
@@ -970,7 +1071,6 @@ class TradingBot:
                                 side = 'long' if new_status == 'SYNC_LONG' else 'short'
                                 self.virtual_managers[symbol].start_sync(side, sync_entry)
                         
-                        # 설정값 업데이트
                         if symbol in self.real_managers:
                             self.real_managers[symbol].config = config
                         if symbol in self.virtual_managers:
@@ -979,7 +1079,6 @@ class TradingBot:
                 except Exception as e:
                     logging.error(f"설정 갱신 에러: {e}")
         
-        # 상태 로깅
         async def log_status():
             while is_running:
                 await asyncio.sleep(300)
@@ -999,7 +1098,7 @@ class TradingBot:
 # ==============================================================================
 def main():
     logging.info("=" * 70)
-    logging.info("  Bitget Bot v24.2 - 웹소켓 + Google Sheets + 동기화 모드")
+    logging.info("  Bitget Bot v24.3 - 웹소켓 + Google Sheets + 텔레그램")
     logging.info("=" * 70)
     
     bot = TradingBot()
