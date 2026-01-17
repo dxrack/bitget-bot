@@ -327,11 +327,15 @@ def generate_signal(symbol, config):
     
     candles = candle_data.get(symbol, [])
     
-    if len(candles) < 100:
+    if len(candles) < 101:
         return None, None
+        
+    # 완성된 캔들만 사용 (마지막은 진행 중이므로 제외)
+    completed_candles = candles[:-1]
+    
     
     current_trend, prev_trend = calculate_supertrend(
-        candles, 
+        completed_candles,   # ← 완성된 캔들만!
         config['atr_period'], 
         config['atr_multiplier']
     )
@@ -339,13 +343,16 @@ def generate_signal(symbol, config):
     if current_trend is None:
         return None, None
     
-    pattern = detect_engulfing(candles)
+    # 패턴 감지
+    pattern = detect_engulfing(completed_candles)  # ← 완성된 캔들만!
     
     if pattern is None:
         return None, None
     
+     # 진입가는 현재 캔들 시가
     entry_price = candles[-1][1]
     
+    # 신호 판단
     if current_trend == 1 and pattern == 'bullish':
         logging.info(f"[{symbol}] LONG 신호! 트렌드:상승 패턴:Bullish @ {entry_price}")
         return 'long', entry_price
