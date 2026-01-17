@@ -7,6 +7,7 @@ Bitget Bot v24.3 - 웹소켓 + Google Sheets + 동기화 모드 + 텔레그램
 - 최대 20개 코인 동시 운영
 
 v24.3 - 텔레그램 알림 추가
+v24.4 - 초기 캔들 3000개 로드 (동기화 개선)
 """
 
 import ccxt
@@ -25,7 +26,7 @@ import numpy as np
 import time
 
 # ==============================================================================
-# [로그 설정]
+# [로그 설정]  
 # ==============================================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -335,7 +336,7 @@ def generate_signal(symbol, config):
     
     
     current_trend, prev_trend = calculate_supertrend(
-        completed_candles,   # ← 완성된 캔들만!
+        completed_candles,
         config['atr_period'], 
         config['atr_multiplier']
     )
@@ -344,12 +345,12 @@ def generate_signal(symbol, config):
         return None, None
     
     # 패턴 감지
-    pattern = detect_engulfing(completed_candles)  # ← 완성된 캔들만!
+    pattern = detect_engulfing(completed_candles)
     
     if pattern is None:
         return None, None
     
-     # 진입가는 현재 캔들 시가
+    # 진입가는 현재 캔들 시가
     entry_price = candles[-1][1]
     
     # 신호 판단
@@ -935,22 +936,23 @@ class TradingBot:
         
         # 시작 알림
         msg = f"🚀 <b>봇 시작</b>\n\n"
-        msg += f"버전: v24.3\n"
+        msg += f"버전: v24.4\n"
         msg += f"코인: {len(configs)}개 활성화"
         telegram.send_sync(msg)
         
         return True
     
-   def _load_initial_candles(self, symbol, config):
+    def _load_initial_candles(self, symbol, config):
         global candle_data
-
+        
         try:
             timeframe = config.get('timeframe', '3m')
-
+            
+            # 3000개 이상 로드 (여러 번 호출)
             all_candles = []
             since = None
             target_count = 3000
-
+            
             while len(all_candles) < target_count:
                 ohlcv = self.exchange.fetch_ohlcv(
                     symbol,
@@ -958,22 +960,25 @@ class TradingBot:
                     since=since,
                     limit=1000
                 )
-
+                
                 if not ohlcv:
                     break
-
+                
                 if since is None:
+                    # 첫 호출: 최신 1000개
                     all_candles = ohlcv
+                    # 더 과거 데이터 가져오기 위해 since 설정
                     since = ohlcv[0][0] - 1
                 else:
+                    # 이전 데이터를 앞에 붙이기
                     all_candles = ohlcv + all_candles
                     since = ohlcv[0][0] - 1
-
+                
                 time.sleep(0.1)
-
+            
             candle_data[symbol] = all_candles
             logging.info(f"[{symbol}] 초기 캔들 {len(all_candles)}개 로드")
-
+            
         except Exception as e:
             logging.error(f"[{symbol}] 초기 캔들 로드 실패: {e}")
     
@@ -1130,7 +1135,7 @@ class TradingBot:
 # ==============================================================================
 def main():
     logging.info("=" * 70)
-    logging.info("  Bitget Bot v24.3 - 웹소켓 + Google Sheets + 텔레그램")
+    logging.info("  Bitget Bot v24.4 - 웹소켓 + Google Sheets + 텔레그램")
     logging.info("=" * 70)
     
     bot = TradingBot()
