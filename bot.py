@@ -941,24 +941,23 @@ class TradingBot:
         
         return True
     
-    def _load_initial_candles(self, symbol, config):
-    global candle_data
-    
-    try:
-        timeframe = config.get('timeframe', '3m')
+   def _load_initial_candles(self, symbol, config):
+        global candle_data                          # ← 8칸 스페이스!
         
-        # 3000개 이상 로드 (여러 번 호출)
-        all_candles = []
-        since = None
-        target_count = 3000  # 원하는 캔들 수
-        
-        while len(all_candles) < target_count:
-            ohlcv = self.exchange.fetch_ohlcv(
-                symbol, 
-                timeframe, 
-                since=since,
-                limit=1000
-            )
+        try:                                        # ← 8칸 스페이스!
+            timeframe = config.get('timeframe', '3m')
+            
+            all_candles = []
+            since = None
+            target_count = 3000
+            
+            while len(all_candles) < target_count:
+                ohlcv = self.exchange.fetch_ohlcv(
+                    symbol,
+                    timeframe,
+                    since=since,
+                    limit=1000
+                )
             
             if not ohlcv:
                 break
