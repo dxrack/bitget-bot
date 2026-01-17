@@ -942,15 +942,44 @@ class TradingBot:
         return True
     
     def _load_initial_candles(self, symbol, config):
-        global candle_data
+    global candle_data
+    
+    try:
+        timeframe = config.get('timeframe', '3m')
         
-        try:
-            timeframe = config.get('timeframe', '3m')
-            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=500)
-            candle_data[symbol] = ohlcv
-            logging.info(f"[{symbol}] 초기 캔들 {len(ohlcv)}개 로드")
-        except Exception as e:
-            logging.error(f"[{symbol}] 초기 캔들 로드 실패: {e}")
+        # 3000개 이상 로드 (여러 번 호출)
+        all_candles = []
+        since = None
+        target_count = 3000  # 원하는 캔들 수
+        
+        while len(all_candles) < target_count:
+            ohlcv = self.exchange.fetch_ohlcv(
+                symbol, 
+                timeframe, 
+                since=since,
+                limit=1000
+            )
+            
+            if not ohlcv:
+                break
+            
+            if since is None:
+                # 첫 호출: 최신 1000개
+                all_candles = ohlcv
+                # 더 과거 데이터 가져오기 위해 since 설정
+                since = ohlcv[0][0] - 1  # 가장 오래된 것보다 1ms 이전
+            else:
+                # 이전 데이터를 앞에 붙이기
+                all_candles = ohlcv + all_candles
+                since = ohlcv[0][0] - 1
+            
+            time.sleep(0.1)  # rate limit
+        
+        candle_data[symbol] = all_candles
+        logging.info(f"[{symbol}] 초기 캔들 {len(all_candles)}개 로드")
+        
+    except Exception as e:
+        logging.error(f"[{symbol}] 초기 캔들 로드 실패: {e}")
     
     def on_candle_update(self, symbol, candle_raw):
         global candle_data, coin_configs
