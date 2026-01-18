@@ -1,13 +1,15 @@
 """
-Bitget Bot v24.3 - 웹소켓 + Google Sheets + 동기화 모드 + 텔레그램
+Bitget Bot v24.5 - 웹소켓 + Google Sheets + 동기화 모드 + 텔레그램 + 복리매매
 - 실시간 캔들 데이터 수신 (웹소켓)
 - Google Sheets에서 코인별 설정 읽기
 - 동기화 모드: 가상 포지션으로 실시간 테스트와 맞춤
 - 텔레그램 알림: 진입/청산/동기화 알림
 - 최대 20개 코인 동시 운영
+- 복리 매매: 현재자본금 자동 업데이트, 최저/최고 자본금 제한
 
 v24.3 - 텔레그램 알림 추가
 v24.4 - 초기 캔들 3000개 로드 (동기화 개선)
+v24.5 - 복리 매매 기능 (레버리지, 현재자본금, 최저/최고자본금)
 """
 
 import ccxt
@@ -183,6 +185,12 @@ class GoogleSheetsManager:
                             except:
                                 sync_entry = 0.0
                         
+                        # 복리 매매 관련 설정 읽기
+                        leverage = int(row.get('레버리지', 1))
+                        current_capital = float(row.get('현재자본금', 30.0))
+                        min_capital = float(row.get('최저자본금', 10.0))
+                        max_capital = float(row.get('최고자본금', 10000.0))
+                        
                         new_configs[symbol] = {
                             'name': row.get('코인명', ''),
                             'symbol': symbol,
@@ -194,12 +202,14 @@ class GoogleSheetsManager:
                             'atr_multiplier': float(row.get('슈퍼트렌드 배수', 8.1)),
                             'timeframe': row.get('진입시간봉', '3m'),
                             'entry_condition': row.get('진입조건', ''),
-                            'capital': 30.0,
-                            'leverage': 1,
+                            'leverage': leverage,
+                            'current_capital': current_capital,
+                            'min_capital': min_capital,
+                            'max_capital': max_capital,
                             'status': status,
                             'sync_entry_price': sync_entry
                         }
-                        logging.info(f"코인 로드: {symbol} | 상태:{status} | 동기화진입가:{sync_entry}")
+                        logging.info(f"코인 로드: {symbol} | 상태:{status} | 자본금:{current_capital} | 레버리지:{leverage}x")
             
             coin_configs = new_configs
             self.last_fetch_time = now
@@ -226,6 +236,26 @@ class GoogleSheetsManager:
             return False
         except Exception as e:
             logging.error(f"시트 업데이트 실패: {e}")
+            return False
+    
+    def update_current_capital(self, symbol, new_capital):
+        """현재자본금 업데이트 (복리 매매용)"""
+        try:
+            all_data = self.sheet.get_all_records()
+            for idx, row in enumerate(all_data):
+                if row.get('거래쌍', '') == symbol:
+                    headers = self.sheet.row_values(1)
+                    if '현재자본금' in headers:
+                        col_idx = headers.index('현재자본금') + 1
+                        row_idx = idx + 2
+                        # 소수점 2자리로 반올림
+                        new_capital = round(new_capital, 2)
+                        self.sheet.update_cell(row_idx, col_idx, new_capital)
+                        logging.info(f"[{symbol}] 현재자본금 업데이트: ${new_capital:.2f}")
+                    return True
+            return False
+        except Exception as e:
+            logging.error(f"현재자본금 업데이트 실패: {e}")
             return False
 
 # ==============================================================================
@@ -565,10 +595,11 @@ class VirtualPositionManager:
 # ==============================================================================
 class RealPositionManager:
     
-    def __init__(self, exchange, symbol, config):
+    def __init__(self, exchange, symbol, config, sheets_manager):
         self.exchange = exchange
         self.symbol = symbol
         self.config = config
+        self.sheets_manager = sheets_manager
         
         self.side = None
         self.entry_price = 0
@@ -579,10 +610,39 @@ class RealPositionManager:
         self.is_active = False
         self._last_log_time = 0
         
+        # 복리 매매용: 이번 거래에 사용된 자본금
+        self.used_capital = 0
+        
     def open_position(self, side, entry_price):
         try:
-            capital = self.config.get('capital', 30.0)
+            # 복리 매매: 자본금 설정 가져오기
+            current_capital = self.config.get('current_capital', 30.0)
+            min_capital = self.config.get('min_capital', 10.0)
+            max_capital = self.config.get('max_capital', 10000.0)
             leverage = self.config.get('leverage', 1)
+            
+            # 최저 자본금 체크 - 미달 시 매매 금지
+            if current_capital < min_capital:
+                logging.warning(f"[{self.symbol}] ⚠️ 매매 금지! 현재자본금(${current_capital:.2f}) < 최저자본금(${min_capital:.2f})")
+                
+                # 텔레그램 알림
+                name = self.config.get('name', self.symbol)
+                msg = f"⚠️ <b>매매 금지</b>\n\n"
+                msg += f"코인: {name}\n"
+                msg += f"현재자본금: ${current_capital:.2f}\n"
+                msg += f"최저자본금: ${min_capital:.2f}\n"
+                msg += f"→ 자본금 충전 필요!"
+                telegram.send_sync(msg)
+                return False
+            
+            # 최고 자본금 체크 - 초과 시 최고 금액으로 제한
+            actual_capital = current_capital
+            if current_capital > max_capital:
+                actual_capital = max_capital
+                logging.info(f"[{self.symbol}] 자본금 제한: ${current_capital:.2f} → ${max_capital:.2f}")
+            
+            # 이번 거래에 사용할 자본금 저장
+            self.used_capital = actual_capital
             
             price_prec, amount_prec = get_precision(self.exchange, self.symbol)
             
@@ -590,14 +650,14 @@ class RealPositionManager:
                 logging.error(f"[{self.symbol}] 잘못된 진입가: {entry_price}")
                 return False
             
-            qty_raw = (capital * leverage) / float(entry_price)
+            qty_raw = (actual_capital * leverage) / float(entry_price)
             qty = truncate(qty_raw, amount_prec)
             
             if qty <= 0:
                 logging.error(f"[{self.symbol}] 수량 계산 오류: {qty}")
                 return False
             
-            logging.info(f"[{self.symbol}] 주문 준비: {side.upper()} qty={qty} @ {entry_price}")
+            logging.info(f"[{self.symbol}] 주문 준비: {side.upper()} 자본금=${actual_capital:.2f} 레버리지={leverage}x qty={qty} @ {entry_price}")
             
             try:
                 self.exchange.set_leverage(leverage, self.symbol)
@@ -640,6 +700,8 @@ class RealPositionManager:
             msg += f"방향: {side.upper()}\n"
             msg += f"진입가: {actual_entry:.4f}\n"
             msg += f"수량: {qty}\n"
+            msg += f"자본금: ${actual_capital:.2f}\n"
+            msg += f"레버리지: {leverage}x\n"
             msg += f"초기 SL: {self.current_sl:.4f}"
             telegram.send_sync(msg)
             
@@ -744,12 +806,34 @@ class RealPositionManager:
                 params={'reduceOnly': True}
             )
             
+            # 수익률 계산
             if self.side == 'long':
                 pnl_pct = (exit_price / self.entry_price - 1) * 100
             else:
                 pnl_pct = (self.entry_price / exit_price - 1) * 100
             
-            logging.info(f"[{self.symbol}] ✅ 포지션 청산: {reason} @ {exit_price:.6f} PnL:{pnl_pct:+.2f}%")
+            # 레버리지 적용된 실제 수익률
+            leverage = self.config.get('leverage', 1)
+            actual_pnl_pct = pnl_pct * leverage
+            
+            # 복리 매매: 새 자본금 계산 (단순 복리)
+            old_capital = self.config.get('current_capital', 30.0)
+            profit_amount = self.used_capital * (actual_pnl_pct / 100)
+            new_capital = old_capital + profit_amount
+            
+            # 새 자본금이 0 이하면 최소값으로
+            if new_capital <= 0:
+                new_capital = 0.01
+            
+            logging.info(f"[{self.symbol}] ✅ 포지션 청산: {reason} @ {exit_price:.6f}")
+            logging.info(f"[{self.symbol}] 💰 수익: {pnl_pct:+.2f}% (레버리지 적용: {actual_pnl_pct:+.2f}%)")
+            logging.info(f"[{self.symbol}] 💵 자본금: ${old_capital:.2f} → ${new_capital:.2f} ({profit_amount:+.2f})")
+            
+            # 구글 시트 현재자본금 업데이트
+            self.sheets_manager.update_current_capital(self.symbol, new_capital)
+            
+            # config도 업데이트 (다음 거래에 반영)
+            self.config['current_capital'] = new_capital
             
             # 텔레그램 알림
             name = self.config.get('name', self.symbol)
@@ -761,7 +845,9 @@ class RealPositionManager:
             msg += f"진입: {self.entry_price:.4f}\n"
             msg += f"청산: {exit_price:.4f}\n"
             msg += f"사유: {reason}\n"
-            msg += f"결과: {result} {pnl_pct:+.2f}%"
+            msg += f"수익률: {pnl_pct:+.2f}% (x{leverage}={actual_pnl_pct:+.2f}%)\n"
+            msg += f"손익: {profit_amount:+.2f}$\n"
+            msg += f"자본금: ${old_capital:.2f} → ${new_capital:.2f}"
             telegram.send_sync(msg)
             
             self.is_active = False
@@ -769,6 +855,7 @@ class RealPositionManager:
             self.entry_price = 0
             self.qty = 0
             self.trailing_active = False
+            self.used_capital = 0
             
             return True
             
@@ -921,8 +1008,13 @@ class TradingBot:
         for symbol, config in configs.items():
             self._load_initial_candles(symbol, config)
             
-            self.real_managers[symbol] = RealPositionManager(self.exchange, symbol, config)
-            self.virtual_managers[symbol] = VirtualPositionManager(symbol, config, self.sheets_manager)
+            # RealPositionManager에 sheets_manager 전달 (복리 매매용)
+            self.real_managers[symbol] = RealPositionManager(
+                self.exchange, symbol, config, self.sheets_manager
+            )
+            self.virtual_managers[symbol] = VirtualPositionManager(
+                symbol, config, self.sheets_manager
+            )
             
             status = config.get('status', 'WAITING')
             sync_entry = config.get('sync_entry_price', 0)
@@ -936,7 +1028,7 @@ class TradingBot:
         
         # 시작 알림
         msg = f"🚀 <b>봇 시작</b>\n\n"
-        msg += f"버전: v24.4\n"
+        msg += f"버전: v24.5 (복리매매)\n"
         msg += f"코인: {len(configs)}개 활성화"
         telegram.send_sync(msg)
         
@@ -1090,7 +1182,7 @@ class TradingBot:
                         if symbol not in self.real_managers:
                             self._load_initial_candles(symbol, config)
                             self.real_managers[symbol] = RealPositionManager(
-                                self.exchange, symbol, config
+                                self.exchange, symbol, config, self.sheets_manager
                             )
                             self.virtual_managers[symbol] = VirtualPositionManager(
                                 symbol, config, self.sheets_manager
@@ -1108,6 +1200,7 @@ class TradingBot:
                                 side = 'long' if new_status == 'SYNC_LONG' else 'short'
                                 self.virtual_managers[symbol].start_sync(side, sync_entry)
                         
+                        # config 업데이트 (자본금 변경사항 반영)
                         if symbol in self.real_managers:
                             self.real_managers[symbol].config = config
                         if symbol in self.virtual_managers:
@@ -1135,7 +1228,7 @@ class TradingBot:
 # ==============================================================================
 def main():
     logging.info("=" * 70)
-    logging.info("  Bitget Bot v24.4 - 웹소켓 + Google Sheets + 텔레그램")
+    logging.info("  Bitget Bot v24.5 - 웹소켓 + Google Sheets + 텔레그램 + 복리매매")
     logging.info("=" * 70)
     
     bot = TradingBot()
