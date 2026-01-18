@@ -1,15 +1,17 @@
 """
-Bitget Bot v24.5 - 웹소켓 + Google Sheets + 동기화 모드 + 텔레그램 + 복리매매
+Bitget Bot v24.6 - 웹소켓 + Google Sheets + 동기화 모드 + 텔레그램 + 복리매매 + 코인별 진입조건
 - 실시간 캔들 데이터 수신 (웹소켓)
 - Google Sheets에서 코인별 설정 읽기
 - 동기화 모드: 가상 포지션으로 실시간 테스트와 맞춤
 - 텔레그램 알림: 진입/청산/동기화 알림
 - 최대 20개 코인 동시 운영
 - 복리 매매: 현재자본금 자동 업데이트, 최저/최고 자본금 제한
+- 코인별 진입조건: L추세, L패턴, S추세, S패턴
 
 v24.3 - 텔레그램 알림 추가
 v24.4 - 초기 캔들 3000개 로드 (동기화 개선)
 v24.5 - 복리 매매 기능 (레버리지, 현재자본금, 최저/최고자본금)
+v24.6 - 코인별 진입조건 (L추세, L패턴, S추세, S패턴)
 """
 
 import ccxt
@@ -191,25 +193,39 @@ class GoogleSheetsManager:
                         min_capital = float(row.get('최저자본금', 10.0))
                         max_capital = float(row.get('최고자본금', 10000.0))
                         
+                        # 코인별 진입조건 읽기 (상/하)
+                        l_trend = str(row.get('L추세', '상')).strip()
+                        l_pattern = str(row.get('L패턴', '상')).strip()
+                        s_trend = str(row.get('S추세', '하')).strip()
+                        s_pattern = str(row.get('S패턴', '하')).strip()
+                        
                         new_configs[symbol] = {
                             'name': row.get('코인명', ''),
                             'symbol': symbol,
-                            'stop_loss_pct': float(row.get('손절 %', 2.8)),
+                            # 진입조건
+                            'long_trend': l_trend,      # 상 또는 하
+                            'long_pattern': l_pattern,  # 상 또는 하
+                            'short_trend': s_trend,     # 상 또는 하
+                            'short_pattern': s_pattern, # 상 또는 하
+                            # 손절/트레일링
                             'trailing_trigger_pct': float(row.get('트레일링 시작%', 3.0)),
                             'trailing_gap_pct': float(row.get('트레일링 스톱%', 1.9)),
+                            'stop_loss_pct': float(row.get('손절%', 2.8)),
                             'be_buffer_pct': float(row.get('BE 버퍼%', 0.2)),
+                            # 슈퍼트렌드
                             'atr_period': int(row.get('슈퍼트렌드 기간', 81)),
                             'atr_multiplier': float(row.get('슈퍼트렌드 배수', 8.1)),
                             'timeframe': row.get('진입시간봉', '3m'),
-                            'entry_condition': row.get('진입조건', ''),
+                            # 자본금
                             'leverage': leverage,
                             'current_capital': current_capital,
                             'min_capital': min_capital,
                             'max_capital': max_capital,
+                            # 상태
                             'status': status,
                             'sync_entry_price': sync_entry
                         }
-                        logging.info(f"코인 로드: {symbol} | 상태:{status} | 자본금:{current_capital} | 레버리지:{leverage}x")
+                        logging.info(f"코인 로드: {symbol} | L:{l_trend}/{l_pattern} S:{s_trend}/{s_pattern} | 자본금:{current_capital}")
             
             coin_configs = new_configs
             self.last_fetch_time = now
@@ -351,7 +367,7 @@ def detect_engulfing(candles):
     return None
 
 # ==============================================================================
-# [신호 생성]
+# [신호 생성 - 코인별 진입조건 적용]
 # ==============================================================================
 def generate_signal(symbol, config):
     global candle_data
@@ -363,7 +379,6 @@ def generate_signal(symbol, config):
         
     # 완성된 캔들만 사용 (마지막은 진행 중이므로 제외)
     completed_candles = candles[:-1]
-    
     
     current_trend, prev_trend = calculate_supertrend(
         completed_candles,
@@ -383,13 +398,28 @@ def generate_signal(symbol, config):
     # 진입가는 현재 캔들 시가
     entry_price = candles[-1][1]
     
-    # 신호 판단
-    if current_trend == 1 and pattern == 'bullish':
-        logging.info(f"[{symbol}] LONG 신호! 트렌드:상승 패턴:Bullish @ {entry_price}")
+    # 코인별 진입조건 가져오기
+    long_trend_cond = config.get('long_trend', '상')    # 상 또는 하
+    long_pattern_cond = config.get('long_pattern', '상')  # 상 또는 하
+    short_trend_cond = config.get('short_trend', '하')   # 상 또는 하
+    short_pattern_cond = config.get('short_pattern', '하') # 상 또는 하
+    
+    # 현재 트렌드를 상/하로 변환
+    # current_trend: 1 = 상승, -1 = 하락
+    trend_str = '상' if current_trend == 1 else '하'
+    
+    # 현재 패턴을 상/하로 변환
+    # pattern: 'bullish' = 상승(상), 'bearish' = 하락(하)
+    pattern_str = '상' if pattern == 'bullish' else '하'
+    
+    # LONG 신호 체크
+    if trend_str == long_trend_cond and pattern_str == long_pattern_cond:
+        logging.info(f"[{symbol}] LONG 신호! 트렌드:{trend_str} 패턴:{pattern_str} (조건: {long_trend_cond}/{long_pattern_cond}) @ {entry_price}")
         return 'long', entry_price
     
-    if current_trend == -1 and pattern == 'bearish':
-        logging.info(f"[{symbol}] SHORT 신호! 트렌드:하락 패턴:Bearish @ {entry_price}")
+    # SHORT 신호 체크
+    if trend_str == short_trend_cond and pattern_str == short_pattern_cond:
+        logging.info(f"[{symbol}] SHORT 신호! 트렌드:{trend_str} 패턴:{pattern_str} (조건: {short_trend_cond}/{short_pattern_cond}) @ {entry_price}")
         return 'short', entry_price
     
     return None, None
@@ -1028,7 +1058,7 @@ class TradingBot:
         
         # 시작 알림
         msg = f"🚀 <b>봇 시작</b>\n\n"
-        msg += f"버전: v24.5 (복리매매)\n"
+        msg += f"버전: v24.6 (코인별 진입조건)\n"
         msg += f"코인: {len(configs)}개 활성화"
         telegram.send_sync(msg)
         
@@ -1200,7 +1230,7 @@ class TradingBot:
                                 side = 'long' if new_status == 'SYNC_LONG' else 'short'
                                 self.virtual_managers[symbol].start_sync(side, sync_entry)
                         
-                        # config 업데이트 (자본금 변경사항 반영)
+                        # config 업데이트 (자본금/진입조건 변경사항 반영)
                         if symbol in self.real_managers:
                             self.real_managers[symbol].config = config
                         if symbol in self.virtual_managers:
@@ -1228,7 +1258,7 @@ class TradingBot:
 # ==============================================================================
 def main():
     logging.info("=" * 70)
-    logging.info("  Bitget Bot v24.5 - 웹소켓 + Google Sheets + 텔레그램 + 복리매매")
+    logging.info("  Bitget Bot v24.6 - 코인별 진입조건 + 복리매매")
     logging.info("=" * 70)
     
     bot = TradingBot()
